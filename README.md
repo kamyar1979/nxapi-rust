@@ -1,59 +1,121 @@
 # nxapi
 
-Shared Rust library for Cisco NX-API **enforcement**. PCEF will consume it
-through its own `EnforcementTarget`. The SDK does not depend on Qanat routing,
-OSS event contracts, RabbitMQ, BSS, or customer inventory storage.
+A Rust library for describing interface enforcement operations on Cisco
+NX-OS devices: administrative state changes and bandwidth policing.
 
-## Current status
+**Current status:** the crate provides validated Ethernet identifiers and typed
+operation descriptions. It does not yet send NX-API requests. Authentication,
+HTTP transport, device configuration and readback verification are not implemented.
+The examples below construct operations locally; they do not modify a switch.
 
-This is the initial project scaffold, not a functioning switch client yet.
-It provides validated Ethernet identifiers and typed operation descriptions.
-No network requests are made and PCEF has not been migrated to this crate.
+## Installation
 
-The first implementation will cover only:
+Add the Git dependency to your `Cargo.toml`:
 
-- Interface administrative enable/disable.
-- Create/update and attach per-interface bandwidth policers.
-- Remove SDK-owned throttling without changing link state.
-- Read back policy configuration and attachment to verify results.
-- Login/session handling, secure-by-default TLS, an explicit lab bypass,
-  injectable HTTP transport, and structured Cisco/partial-operation errors.
-
-Provisioning features and support for other Cisco operating systems are out
-of scope. NX-OS version and platform limitations must be verified on devices.
-An HTTP success response alone must not be reported as verified enforcement.
-
-## Development
-
-```sh
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets -- -D warnings
-cargo doc --no-deps
+```toml
+[dependencies]
+nxapi = { git = "https://github.com/kamyar1979/nxapi-rust" }
 ```
 
-## GitHub Actions and releases
+## Validate an interface
 
-`.github/workflows/release.yml` follows Qanat's release workflow. Pushing a
-`v*` tag runs formatting, Clippy, tests and package verification. The tag must
-match the Cargo version (for example, `v0.1.0`). Successful verification is
-followed by publication to crates.io and a GitHub release with generated notes.
-Tags containing a hyphen produce a GitHub prerelease. Like Qanat, this workflow
-is tag-triggered; normal branch pushes and pull requests do not trigger it.
+Physical and breakout Ethernet identifiers are normalized to NX-API form.
 
-Before releasing:
+```rust
+use nxapi::EthernetInterface;
 
-1. Create the public GitHub repository and configure its Git remote. Add the
-   actual repository URL to Cargo.toml once it exists.
-2. Create the GitHub `release` environment, preferably with required approval.
-3. Add a crates.io publishing token as `CARGO_REGISTRY_TOKEN` in that environment.
-4. Commit the sources and Cargo.lock, then push a matching version tag when the
-   crate is ready for public release.
+fn main() -> Result<(), nxapi::InvalidInterface> {
+    let interface: EthernetInterface = "Ethernet1/1".parse()?;
+    assert_eq!(interface.as_str(), "eth1/1");
 
-No workflow has been run remotely and the crate has not been published. The
-name `nxapi` was absent from crates.io when checked on 2026-09-25; this does not
-reserve it. Publication is restricted to crates.io, not the private registry.
+    let breakout: EthernetInterface = "Ethernet1/1/2".parse()?;
+    assert_eq!(breakout.as_str(), "eth1/1/2");
+
+    assert!("mgmt0".parse::<EthernetInterface>().is_err());
+    assert!("eth1/../1".parse::<EthernetInterface>().is_err());
+    Ok(())
+}
+```
+
+Validation checks the identifier's syntax, not whether the port exists on the
+device. Management interfaces, port channels and subinterfaces are not supported.
+
+## Describe bandwidth limits
+
+Create separate operations for each direction. Rates are in **bits per second**;
+an optional burst is in **bytes**. `NonZeroU64` prevents zero-valued rates or
+explicit bursts.
+
+```rust
+use std::num::NonZeroU64;
+use nxapi::{Direction, EnforcementOperation, EthernetInterface};
+
+fn main() -> Result<(), nxapi::InvalidInterface> {
+    let interface: EthernetInterface = "Ethernet1/1".parse()?;
+
+    let upload = EnforcementOperation::Throttle {
+        interface: interface.clone(),
+        direction: Direction::Ingress,
+        rate_bps: NonZeroU64::new(10_000_000).unwrap(), // 10 Mbps
+        burst_bytes: None,
+    };
+
+    let download = EnforcementOperation::Throttle {
+        interface,
+        direction: Direction::Egress,
+        rate_bps: NonZeroU64::new(20_000_000).unwrap(), // 20 Mbps
+        burst_bytes: NonZeroU64::new(65_536),
+    };
+
+    println!("{upload:?}");
+    println!("{download:?}");
+    Ok(())
+}
+```
+
+On a customer-facing switch port, ingress is customer upload and egress is
+customer download. This model targets a dedicated customer interface, not
+individual IP addresses on a shared port. Policing support and valid rate/burst
+values depend on the device and NX-OS version; constructing an operation does
+not establish support.
+
+## Describe an administrative state change
+
+```rust
+use nxapi::EnforcementOperation;
+
+fn main() -> Result<(), nxapi::InvalidInterface> {
+    let disable = EnforcementOperation::SetAdminState {
+        interface: "Ethernet1/1".parse()?,
+        enabled: false,
+    };
+    println!("{disable:?}");
+    Ok(())
+}
+```
+
+Use `enabled: true` to describe enabling the interface. Administrative state
+and throttling are separate operations: enabling a port does not remove a policer.
+
+## Describe removal of throttling
+
+```rust
+use nxapi::{Direction, EnforcementOperation};
+
+fn main() -> Result<(), nxapi::InvalidInterface> {
+    let remove = EnforcementOperation::RemoveThrottle {
+        interface: "Ethernet1/1".parse()?,
+        direction: Direction::Ingress,
+    };
+    println!("{remove:?}");
+    Ok(())
+}
+```
+
+The intended removal scope is SDK-owned policing in the selected direction,
+without changing the interface administrative state. Describe a second operation
+with `Direction::Egress` to remove the restriction in both directions.
 
 ## License
 
-Apache-2.0, matching Qanat. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
