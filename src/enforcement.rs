@@ -63,8 +63,8 @@ impl FromStr for EthernetInterface {
 
 /// Desired operation on a dedicated customer interface.
 ///
-/// These are operation descriptions, not executable HTTP requests. Device
-/// capability checks and verified execution will be added to the SDK separately.
+/// Pass these operations to [crate::Client::apply]. The caller must ensure
+/// the port is dedicated and supports the requested policing direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnforcementOperation {
     /// Set the interface administrative state. Does not remove policing.
