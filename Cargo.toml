@@ -1,0 +1,10 @@
+[package]
+name = "nxapi"
+version = "0.1.0"
+edition = "2024"
+description = "Typed Cisco NX-API enforcement SDK for OSS services"
+license = "Apache-2.0"
+readme = "README.md"
+publish = ["crates-io"]
+
+[dependencies]
