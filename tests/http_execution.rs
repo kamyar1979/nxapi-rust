@@ -198,25 +198,136 @@ async fn policing_payload_and_attachment_are_generated_for_both_directions() {
     }
 }
 
+fn attachment(name: &str) -> (u16, String) {
+    (
+        200,
+        json!({"imdata":[{"ipqosInst":{"attributes":{"name":name}}}]}).to_string(),
+    )
+}
+
+fn removal(direction: Direction) -> Op {
+    Op::RemoveThrottle {
+        interface: interface(),
+        direction,
+    }
+}
+
 #[tokio::test]
-async fn removal_only_deletes_owned_policer() {
-    for direction in [Direction::Ingress, Direction::Egress] {
-        let (url, task) = server(vec![success()]).await;
-        client(&url)
-            .apply(&Op::RemoveThrottle {
-                interface: interface(),
-                direction,
-            })
+async fn removal_detaches_then_deletes_owned_map_in_both_directions() {
+    for (direction, suffix) in [(Direction::Ingress, "in"), (Direction::Egress, "out")] {
+        let name = format!("pcef-eth1-10-{suffix}");
+        let (url, task) = server(vec![attachment(&name), success(), success()]).await;
+        let report = client(&url).apply(&removal(direction)).await.unwrap();
+        assert_eq!(report.requests_completed, 2);
+        let records = task.await.unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records[0].head.starts_with(&format!(
+            "GET /api/mo/sys/ipqos/dflt/policy/{suffix}/intf-[eth1/10]/pmap.json "
+        )));
+        assert!(records[1].head.starts_with(&format!(
+            "POST /api/mo/sys/ipqos/dflt/policy/{suffix}/intf-[eth1/10].json "
+        )));
+        assert_eq!(
+            records[1].body,
+            json!({"ipqosIf":{"attributes":{"name":"eth1/10"},"children":[
+                {"ipqosInst":{"attributes":{"name":name,"status":"deleted"}}}
+            ]}})
+        );
+        assert!(
+            records[2]
+                .head
+                .starts_with("POST /api/mo/sys/ipqos/dflt/p.json ")
+        );
+        assert_eq!(
+            records[2].body,
+            json!({"ipqosPMapEntity":{"children":[
+                {"ipqosPMapInst":{"attributes":{"name":name,"status":"deleted"}}}
+            ]}})
+        );
+        for record in &records {
+            assert!(!record.body.to_string().contains("adminSt"));
+            assert!(!record.body.to_string().contains("ipqosPolice"));
+            assert!(record.head.contains("APIC-cookie=test-token"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn removal_cleans_up_already_detached_map_without_touching_attachment() {
+    for absent in [success(), attachment("")] {
+        let (url, task) = server(vec![absent, success()]).await;
+        assert_eq!(
+            client(&url)
+                .apply(&removal(Direction::Ingress))
+                .await
+                .unwrap()
+                .requests_completed,
+            1
+        );
+        let records = task.await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records[1]
+                .head
+                .starts_with("POST /api/mo/sys/ipqos/dflt/p.json ")
+        );
+    }
+}
+
+#[tokio::test]
+async fn removal_rejects_unowned_or_malformed_attachment_before_any_write() {
+    for response in [
+        attachment("MANUAL-POLICY"),
+        (
+            200,
+            json!({"imdata":[{"ipqosInst":{"attributes":{}}}]}).to_string(),
+        ),
+        (200, json!({"imdata":[{},{}]}).to_string()),
+        (403, "{}".into()),
+        (
+            200,
+            json!({"imdata":[{"error":{"attributes":{"code":"400"}}}]}).to_string(),
+        ),
+    ] {
+        let (url, task) = server(vec![response]).await;
+        let error = client(&url)
+            .apply(&removal(Direction::Ingress))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(error.requests_completed, 0);
         let records = task.await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].body["ipqosPMapEntity"]["children"][0]["ipqosPMapInst"]["children"][0]["ipqosMatchCMap"]
-                ["children"][0]["ipqosPolice"]["attributes"],
-            json!({"status":"deleted"})
-        );
-        assert!(!records[0].body.to_string().contains("adminSt"));
+        assert!(records[0].head.starts_with("GET "));
+    }
+}
+
+#[tokio::test]
+async fn removal_stops_on_detach_or_delete_failure_and_reports_write_progress() {
+    for failed_step in [0, 1] {
+        for failure in [
+            (500, "{}".into()),
+            (
+                200,
+                json!({"imdata":[{"error":{"attributes":{"code":"400"}}}]}).to_string(),
+            ),
+        ] {
+            let mut responses = vec![attachment("pcef-eth1-10-in")];
+            if failed_step == 1 {
+                responses.push(success());
+            }
+            responses.push(failure);
+            let (url, task) = server(responses).await;
+            let error = client(&url)
+                .apply(&removal(Direction::Ingress))
+                .await
+                .unwrap_err();
+            assert_eq!(error.requests_completed, failed_step);
+            assert!(matches!(
+                error.source,
+                Error::Http(500) | Error::Device { .. }
+            ));
+            assert_eq!(task.await.unwrap().len(), failed_step + 2);
+        }
     }
 }
 

@@ -51,13 +51,29 @@ pub(crate) fn requests(operation: &EnforcementOperation, prefix: &str) -> Vec<Re
             interface,
             direction,
         } => {
-            let (_, name) = policy(interface, *direction, prefix);
-            vec![policer(&name, json!({"status":"deleted"}))]
+            let (direction, name) = policy(interface, *direction, prefix);
+            vec![
+                Request {
+                    path: format!(
+                        "/api/mo/sys/ipqos/dflt/policy/{direction}/intf-[{}].json",
+                        interface.as_str()
+                    ),
+                    body: json!({"ipqosIf":{"attributes":{"name":interface.as_str()},"children":[
+                        {"ipqosInst":{"attributes":{"name":name,"status":"deleted"}}}
+                    ]}}),
+                },
+                Request {
+                    path: "/api/mo/sys/ipqos/dflt/p.json".into(),
+                    body: json!({"ipqosPMapEntity":{"children":[
+                        {"ipqosPMapInst":{"attributes":{"name":name,"status":"deleted"}}}
+                    ]}}),
+                },
+            ]
         }
     }
 }
 
-fn policy(
+pub(crate) fn policy(
     interface: &crate::EthernetInterface,
     direction: Direction,
     prefix: &str,

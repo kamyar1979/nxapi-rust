@@ -1,16 +1,19 @@
 # nxapi
 
 Async Cisco Nexus **NX-API REST/DME** client for dedicated-interface enforcement.
-Version 0.2.0 adds real HTTPS execution, authentication, Cisco response checking,
+Version 0.2.0 added real HTTPS execution, authentication, Cisco response checking,
 and administrative-state readback. This is not the NX-API CLI/JSON-RPC interface.
 
 ## Install
 
-After publishing 0.2.0:
+Version 0.2.1 changes RemoveThrottle to detach and delete the owned policy map,
+rather than leave an empty policy attached. No caller API changes are required.
+
+After publishing 0.2.1:
 
 ```toml
 [dependencies]
-nxapi = "0.2.0"
+nxapi = "0.2.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -65,13 +68,26 @@ Authentication failures are returned, not retried.
 | --- | --- |
 | SetAdminState | POST l1PhysIf adminSt=up/down |
 | Throttle | POST ipqosPolice configuration, then POST interface policy attachment |
-| RemoveThrottle | POST status=deleted on the owned ipqosPolice |
+| RemoveThrottle | GET current attachment; POST its deletion; POST owned policy-map deletion |
 | admin_state | GET interface administrative state |
 
 Rates are bits per second; explicit bursts are bytes. A missing burst leaves the
 device's current/default burst unchanged. Each operation affects one direction:
-ingress is customer upload, egress is customer download. Removal leaves an empty
-policy map/attachment for reuse and does not enable a disabled interface.
+ingress is customer upload, egress is customer download. Removal detaches the
+owned service-policy, then deletes the entire owned policy map (including its
+class and policer). It does not enable a disabled interface. Already-detached
+policies skip the detach step, so empty maps left by 0.2.0 can still be cleaned up.
+
+The attachment is read before deletion. An unexpected policy name or malformed
+response fails before any write. This check is not atomic: the caller must
+serialize changes to the dedicated port and prevent other writers racing it.
+The SDK does not delete default policies or unrelated named maps. SDK-owned
+maps must not be shared with other ports. Mutation counts exclude the ownership
+read. A failed detach prevents map deletion; a failed map deletion leaves the
+port detached and reports partial progress. No automatic rollback is performed.
+
+This request sequence is covered by mock HTTP tests; verify it on the target
+NX-OS release before production rollout. No live-switch verification is implied.
 
 Policy names are `nxapi-eth1-10-in` / `nxapi-eth1-10-out`. Set
 `ClientOptions.policy_prefix = "pcef".into()` when adopting existing PCEF

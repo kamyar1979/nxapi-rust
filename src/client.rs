@@ -38,7 +38,7 @@ pub enum Error {
 #[derive(Debug, Error)]
 #[error("NX-API operation failed after {requests_completed} completed requests: {source}")]
 pub struct ApplyError {
-    /// Number of prior requests acknowledged by the device.
+    /// Number of prior mutation requests acknowledged by the device (excludes reads).
     pub requests_completed: usize,
     /// Underlying request failure. A transport failure can have an unknown outcome.
     #[source]
@@ -48,7 +48,7 @@ pub struct ApplyError {
 /// Successful device acknowledgements, not proof of hardware forwarding state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyReport {
-    /// Number of successfully acknowledged requests.
+    /// Number of successfully acknowledged mutation requests (excludes reads).
     pub requests_completed: usize,
 }
 
@@ -196,10 +196,32 @@ impl Client {
     /// Apply one operation on a dedicated, caller-owned customer interface.
     /// Throttle creates the policer before attaching it. On error, no later
     /// request is sent; earlier changes remain. No automatic retry is attempted.
+    /// RemoveThrottle checks attachment ownership, detaches it, then deletes
+    /// the owned policy map. It never changes interface administrative state.
     pub async fn apply(&self, operation: &EnforcementOperation) -> Result<ApplyReport, ApplyError> {
         let requests = dme::requests(operation, &self.options.policy_prefix);
+        let skip_detach = if let EnforcementOperation::RemoveThrottle {
+            interface,
+            direction,
+        } = operation
+        {
+            let (direction, name) = dme::policy(interface, *direction, &self.options.policy_prefix);
+            let path = format!(
+                "/api/mo/sys/ipqos/dflt/policy/{direction}/intf-[{}]/pmap.json",
+                interface.as_str()
+            );
+            !self
+                .owns_attachment(&path, &name)
+                .await
+                .map_err(|source| ApplyError {
+                    requests_completed: 0,
+                    source,
+                })?
+        } else {
+            false
+        };
         let mut completed = 0;
-        for request in requests {
+        for request in requests.into_iter().skip(usize::from(skip_detach)) {
             let result = self
                 .request(Method::POST, &request.path, Some(request.body), true)
                 .await;
@@ -232,6 +254,34 @@ impl Client {
             Some("down") => Ok(false),
             _ => Err(Error::Response("missing interface administrative state")),
         }
+    }
+
+    // ipqosInst is a singleton: its name is not part of its DN. Never delete
+    // that slot without checking which policy is currently attached.
+    async fn owns_attachment(&self, path: &str, expected: &str) -> Result<bool, Error> {
+        let body = self.request(Method::GET, path, None, true).await?;
+        let items = body["imdata"]
+            .as_array()
+            .ok_or(Error::Response("missing attachment data"))?;
+        if items.is_empty() {
+            return Ok(false);
+        }
+        if items.len() != 1 {
+            return Err(Error::Response("ambiguous interface policy attachment"));
+        }
+        let name = items[0]
+            .pointer("/ipqosInst/attributes/name")
+            .and_then(Value::as_str)
+            .ok_or(Error::Response("missing attached policy name"))?;
+        if name.is_empty() {
+            return Ok(false);
+        }
+        if name != expected {
+            return Err(Error::Configuration(
+                "refusing to detach a policy not owned by this operation",
+            ));
+        }
+        Ok(true)
     }
 
     async fn request(

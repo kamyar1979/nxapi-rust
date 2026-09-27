@@ -85,7 +85,8 @@ pub enum EnforcementOperation {
         /// Optional committed burst in bytes, never zero when supplied.
         burst_bytes: Option<NonZeroU64>,
     },
-    /// Remove SDK-owned policing in one direction; leave link state unchanged.
+    /// Detach and delete the SDK-owned policy map in one direction.
+    /// Leaves link state unchanged; refuses to detach another policy.
     RemoveThrottle {
         /// Dedicated customer interface.
         interface: EthernetInterface,
