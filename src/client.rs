@@ -1,4 +1,4 @@
-use crate::{EnforcementOperation, EthernetInterface, dme};
+use crate::{BandwidthPolicy, Direction, EnforcementOperation, EthernetInterface, PolicyName, dme};
 use reqwest::{
     Method, Url,
     header::{COOKIE, HeaderValue},
@@ -191,6 +191,147 @@ impl Client {
             .filter(|v| !v.is_empty() && !v.contains(';') && !v.chars().any(char::is_whitespace))
             .ok_or(Error::Response("missing or invalid login token"))?;
         self.set_session_cookie(&format!("APIC-cookie={token}"))
+    }
+
+    /// Define a new named class-default bandwidth policy without assigning it.
+    /// Fails if the name exists. Existence checks are not atomic: callers must
+    /// serialize policy management with other writers.
+    pub async fn define_policy(
+        &self,
+        name: &PolicyName,
+        policy: &BandwidthPolicy,
+    ) -> Result<(), Error> {
+        if self.policy_exists(name).await? {
+            return Err(Error::Configuration(
+                "policy already exists; use edit_policy",
+            ));
+        }
+        self.write_policy(name, policy).await
+    }
+
+    /// Edit an existing policy's class-default policer without changing assignments.
+    /// This affects every interface using the policy. None for burst preserves it.
+    /// Fails if absent; callers must serialize edits with other policy writers.
+    pub async fn edit_policy(
+        &self,
+        name: &PolicyName,
+        policy: &BandwidthPolicy,
+    ) -> Result<(), Error> {
+        if !self.policy_exists(name).await? {
+            return Err(Error::Configuration("policy does not exist"));
+        }
+        self.write_policy(name, policy).await
+    }
+
+    /// Delete a named policy definition, never implicitly unassigning interfaces.
+    /// Caller must first unassign it everywhere and must own the definition.
+    /// Device rejection (including an in-use policy) is propagated unchanged.
+    pub async fn remove_policy(&self, name: &PolicyName) -> Result<(), Error> {
+        self.request(
+            Method::POST,
+            "/api/mo/sys/ipqos/dflt/p.json",
+            Some(json!({
+                "ipqosPMapEntity":{"children":[{"ipqosPMapInst":{"attributes":{
+                    "name":name.as_str(),"status":"deleted"
+                }}}]}
+            })),
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Assign an existing policy without creating or editing its definition.
+    /// Replaces this direction's existing attachment; caller must own the port.
+    pub async fn assign_policy(
+        &self,
+        name: &PolicyName,
+        interface: &EthernetInterface,
+        direction: Direction,
+    ) -> Result<(), Error> {
+        if !self.policy_exists(name).await? {
+            return Err(Error::Configuration("policy does not exist"));
+        }
+        self.write_assignment(name, interface, direction, false)
+            .await
+    }
+
+    /// Detach the expected policy, preserving its definition and other ports.
+    /// An absent attachment is a no-op; a different attached name is an error.
+    /// The read/check/write is not atomic; callers must serialize port changes.
+    pub async fn unassign_policy(
+        &self,
+        name: &PolicyName,
+        interface: &EthernetInterface,
+        direction: Direction,
+    ) -> Result<(), Error> {
+        let path = format!("{}/pmap.json", Self::assignment_path(interface, direction));
+        if self.owns_attachment(&path, name.as_str()).await? {
+            self.write_assignment(name, interface, direction, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn policy_exists(&self, name: &PolicyName) -> Result<bool, Error> {
+        let path = format!("/api/mo/sys/ipqos/dflt/p/name-{}.json", name.as_str());
+        let body = self.request(Method::GET, &path, None, true).await?;
+        let items = body["imdata"]
+            .as_array()
+            .ok_or(Error::Response("missing policy data"))?;
+        if items.is_empty() {
+            return Ok(false);
+        }
+        if items.len() != 1
+            || items[0]
+                .pointer("/ipqosPMapInst/attributes/name")
+                .and_then(Value::as_str)
+                != Some(name.as_str())
+        {
+            return Err(Error::Response("unexpected policy data"));
+        }
+        Ok(true)
+    }
+
+    async fn write_policy(&self, name: &PolicyName, policy: &BandwidthPolicy) -> Result<(), Error> {
+        let mut attrs = json!({"cirRate":policy.rate_bps.to_string(),"cirUnit":"bps", "conformAction":"transmit","exceedAction":"unspecified"});
+        if let Some(burst) = policy.burst_bytes {
+            attrs["bcRate"] = json!(burst.to_string());
+            attrs["bcUnit"] = json!("bytes");
+        }
+        let request = dme::policer(name.as_str(), attrs);
+        self.request(Method::POST, &request.path, Some(request.body), true)
+            .await?;
+        Ok(())
+    }
+
+    fn assignment_path(interface: &EthernetInterface, direction: Direction) -> String {
+        let direction = match direction {
+            Direction::Ingress => "in",
+            Direction::Egress => "out",
+        };
+        format!(
+            "/api/mo/sys/ipqos/dflt/policy/{direction}/intf-[{}]",
+            interface.as_str()
+        )
+    }
+
+    async fn write_assignment(
+        &self,
+        name: &PolicyName,
+        interface: &EthernetInterface,
+        direction: Direction,
+        remove: bool,
+    ) -> Result<(), Error> {
+        let attrs = if remove {
+            json!({"name":name.as_str(),"status":"deleted"})
+        } else {
+            json!({"name":name.as_str(),"stats":"yes"})
+        };
+        self.request(Method::POST, &format!("{}.json", Self::assignment_path(interface, direction)), Some(json!({
+            "ipqosIf":{"attributes":{"name":interface.as_str()},"children":[{"ipqosInst":{"attributes":attrs}}]}
+        })), true).await?;
+        Ok(())
     }
 
     /// Apply one operation on a dedicated, caller-owned customer interface.

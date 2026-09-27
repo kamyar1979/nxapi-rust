@@ -91,7 +91,7 @@ pub(crate) fn policy(
     )
 }
 
-fn policer(name: &str, attributes: Value) -> Request {
+pub(crate) fn policer(name: &str, attributes: Value) -> Request {
     Request {
         path: "/api/mo/sys/ipqos/dflt/p.json".into(),
         body: json!({"ipqosPMapEntity":{"children":[

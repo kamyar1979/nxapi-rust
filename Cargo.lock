@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "nxapi"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "reqwest",
  "serde_json",

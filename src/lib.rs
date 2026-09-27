@@ -9,6 +9,8 @@
 mod client;
 mod dme;
 pub mod enforcement;
+pub mod policy;
+pub use policy::{BandwidthPolicy, InvalidPolicyName, PolicyName};
 
 pub use client::{ApplyError, ApplyReport, Client, ClientOptions, Error};
 

@@ -94,6 +94,218 @@ fn success() -> (u16, String) {
     (200, r#"{"imdata":[]}"#.into())
 }
 
+fn named_policy() -> (nxapi::PolicyName, nxapi::BandwidthPolicy) {
+    (
+        "quota-10m".parse().unwrap(),
+        nxapi::BandwidthPolicy {
+            rate_bps: NonZeroU64::new(10_000_000).unwrap(),
+            burst_bytes: NonZeroU64::new(8192),
+        },
+    )
+}
+
+fn policy_present() -> (u16, String) {
+    (
+        200,
+        json!({"imdata":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m"}}}]}).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn separate_policy_lifecycle() {
+    for (direction, path_direction) in [(Direction::Ingress, "in"), (Direction::Egress, "out")] {
+        let (url, task) = server(vec![
+            success(),
+            success(),
+            policy_present(),
+            success(),
+            policy_present(),
+            success(),
+            attachment("quota-10m"),
+            success(),
+            success(),
+        ])
+        .await;
+        let c = client(&url);
+        let (name, mut policy) = named_policy();
+        c.define_policy(&name, &policy).await.unwrap();
+        policy.rate_bps = NonZeroU64::new(20_000_000).unwrap();
+        policy.burst_bytes = None;
+        c.edit_policy(&name, &policy).await.unwrap();
+        c.assign_policy(&name, &interface(), direction)
+            .await
+            .unwrap();
+        c.unassign_policy(&name, &interface(), direction)
+            .await
+            .unwrap();
+        c.remove_policy(&name).await.unwrap();
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 9);
+        assert!(
+            requests[0]
+                .head
+                .starts_with("GET /api/mo/sys/ipqos/dflt/p/name-quota-10m.json ")
+        );
+        for (index, rate) in [(1, "10000000"), (3, "20000000")] {
+            assert!(
+                requests[index]
+                    .head
+                    .starts_with("POST /api/mo/sys/ipqos/dflt/p.json ")
+            );
+            let map = &requests[index].body["ipqosPMapEntity"]["children"][0]["ipqosPMapInst"];
+            assert_eq!(map["attributes"]["name"], "quota-10m");
+            let attrs =
+                &map["children"][0]["ipqosMatchCMap"]["children"][0]["ipqosPolice"]["attributes"];
+            assert_eq!(attrs["cirRate"], rate);
+            assert_eq!(attrs["cirUnit"], "bps");
+            if index == 1 {
+                assert_eq!(attrs["bcRate"], "8192");
+            } else {
+                assert!(attrs.get("bcRate").is_none());
+            }
+        }
+        for index in [5, 7] {
+            assert!(requests[index].head.starts_with(&format!(
+                "POST /api/mo/sys/ipqos/dflt/policy/{path_direction}/intf-[eth1/10].json "
+            )));
+            let attrs = &requests[index].body["ipqosIf"]["children"][0]["ipqosInst"]["attributes"];
+            assert_eq!(attrs["name"], "quota-10m");
+            if index == 7 {
+                assert_eq!(attrs["status"], "deleted");
+            } else {
+                assert_eq!(attrs["stats"], "yes");
+            }
+            assert!(requests[index].body.get("ipqosPMapEntity").is_none());
+        }
+        assert_eq!(
+            requests[8].body,
+            json!({"ipqosPMapEntity":{"children":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m","status":"deleted"}}}]}})
+        );
+    }
+}
+
+#[tokio::test]
+async fn separate_policy_preconditions_prevent_writes() {
+    let (name, policy) = named_policy();
+    let (url, task) = server(vec![
+        policy_present(),
+        success(),
+        success(),
+        attachment("unrelated"),
+        success(),
+        (200, json!({"imdata":[{}]}).to_string()),
+    ])
+    .await;
+    let c = client(&url);
+    assert!(matches!(
+        c.define_policy(&name, &policy).await,
+        Err(Error::Configuration(_))
+    ));
+    assert!(matches!(
+        c.edit_policy(&name, &policy).await,
+        Err(Error::Configuration(_))
+    ));
+    assert!(matches!(
+        c.assign_policy(&name, &interface(), Direction::Ingress)
+            .await,
+        Err(Error::Configuration(_))
+    ));
+    assert!(matches!(
+        c.unassign_policy(&name, &interface(), Direction::Ingress)
+            .await,
+        Err(Error::Configuration(_))
+    ));
+    c.unassign_policy(&name, &interface(), Direction::Ingress)
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.edit_policy(&name, &policy).await,
+        Err(Error::Response(_))
+    ));
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|r| r.head.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn separate_policy_mutation_errors_are_returned() {
+    let failure = || {
+        (
+            200,
+            json!({"imdata":[{"error":{"attributes":{"code":"400","text":"rejected"}}}]})
+                .to_string(),
+        )
+    };
+    let (url, task) = server(vec![
+        success(),
+        failure(),
+        policy_present(),
+        failure(),
+        policy_present(),
+        failure(),
+        attachment("quota-10m"),
+        failure(),
+        failure(),
+    ])
+    .await;
+    let c = client(&url);
+    let (name, policy) = named_policy();
+    assert!(matches!(
+        c.define_policy(&name, &policy).await,
+        Err(Error::Device { .. })
+    ));
+    assert!(matches!(
+        c.edit_policy(&name, &policy).await,
+        Err(Error::Device { .. })
+    ));
+    assert!(matches!(
+        c.assign_policy(&name, &interface(), Direction::Ingress)
+            .await,
+        Err(Error::Device { .. })
+    ));
+    assert!(matches!(
+        c.unassign_policy(&name, &interface(), Direction::Ingress)
+            .await,
+        Err(Error::Device { .. })
+    ));
+    assert!(matches!(
+        c.remove_policy(&name).await,
+        Err(Error::Device { .. })
+    ));
+    assert_eq!(task.await.unwrap().len(), 9);
+}
+
+#[test]
+fn policy_names_are_validated() {
+    for name in ["", "../foo", "a/b", "a b", "a?b", "é", &"a".repeat(40)] {
+        assert!(name.parse::<nxapi::PolicyName>().is_err(), "{name}");
+    }
+    for name in ["quota-10m", "customer_1", &"a".repeat(39)] {
+        assert_eq!(name.parse::<nxapi::PolicyName>().unwrap().as_str(), name);
+    }
+}
+
+#[tokio::test]
+async fn invalid_login_tokens_clear_session() {
+    for token in ["", "bad;cookie=x", "bad token", "bad\r\ntoken"] {
+        let (url, task) = server(vec![(
+            200,
+            json!({"aaaLogin":{"attributes":{"token":token}}}).to_string(),
+        )])
+        .await;
+        let mut c = client(&url);
+        assert!(c.login("user", "password").await.is_err());
+        assert!(matches!(
+            c.remove_policy(&named_policy().0).await,
+            Err(Error::Unauthenticated)
+        ));
+        assert_eq!(task.await.unwrap().len(), 1);
+    }
+}
+
 #[tokio::test]
 async fn login_block_unblock_and_readback_use_real_http() {
     let (url, task) = server(vec![

@@ -6,18 +6,65 @@ and administrative-state readback. This is not the NX-API CLI/JSON-RPC interface
 
 ## Install
 
-Version 0.2.1 changes RemoveThrottle to detach and delete the owned policy map,
-rather than leave an empty policy attached. No caller API changes are required.
+Version 0.3.0 adds separate named-policy lifecycle methods. Existing `apply`
+operations remain available for compatibility, including owned-policy cleanup.
 
-After publishing 0.2.1:
+After publishing 0.3.0:
 
 ```toml
 [dependencies]
-nxapi = "0.2.1"
+nxapi = "0.3.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Apply operations
+## Reusable policy lifecycle
+
+Use these methods for pre-provisioned policies shared by multiple interfaces:
+
+| Method | Behavior |
+| --- | --- |
+| `define_policy` | Create a named class-default policer; reject an existing name |
+| `edit_policy` | Update an existing policer; reject a missing name |
+| `remove_policy` | Delete the definition only; caller must unassign it everywhere first |
+| `assign_policy` | Attach an existing policy to an interface/direction, replacing that slot |
+| `unassign_policy` | Detach the expected policy without deleting its definition |
+
+```rust,no_run
+use nxapi::{Client, BandwidthPolicy, Direction};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let mut client = Client::new("https://192.0.2.10:443")?;
+client.login(&std::env::var("NXAPI_USERNAME")?,
+             &std::env::var("NXAPI_PASSWORD")?).await?;
+let name = "quota-10m".parse()?;
+let interface = "Ethernet1/10".parse()?;
+let mut policy = BandwidthPolicy {
+    rate_bps: 10_000_000.try_into()?,
+    burst_bytes: Some(65_536.try_into()?),
+};
+client.define_policy(&name, &policy).await?;
+client.assign_policy(&name, &interface, Direction::Ingress).await?;
+policy.rate_bps = 20_000_000.try_into()?;
+client.edit_policy(&name, &policy).await?;
+client.unassign_policy(&name, &interface, Direction::Ingress).await?;
+client.remove_policy(&name).await?;
+# Ok(())
+# }
+```
+
+Names accept 1–39 ASCII letters, digits, underscores or hyphens. Edits affect
+every interface using the policy, update only its class-default policer, and
+leave other classes intact. `burst_bytes: None` preserves the existing/default
+burst rather than resetting it. Unassign is a no-op if already detached and
+refuses to detach a different policy. Remove does not discover or detach users
+of a policy: the caller must ensure all references are removed first; device
+errors are propagated. All methods return `Result<(), Error>`.
+
+Existence/ownership checks are not atomic with writes. Serialize management
+operations with other writers. These methods never alter interface admin state.
+Login retains the returned APIC cookie; no duplicate login API is needed.
+
+## Legacy per-interface convenience operations
 
 ```rust,no_run
 use std::num::NonZeroU64;
