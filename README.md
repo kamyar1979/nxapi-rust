@@ -6,14 +6,14 @@ and administrative-state readback. This is not the NX-API CLI/JSON-RPC interface
 
 ## Install
 
-Version 0.3.0 adds separate named-policy lifecycle methods. Existing `apply`
-operations remain available for compatibility, including owned-policy cleanup.
+Version 0.4.0 adds contextual, safely redacted transport diagnostics. It retains
+the separate named-policy lifecycle methods and existing `apply` operations.
 
-After publishing 0.3.0:
+After publishing 0.4.0:
 
 ```toml
 [dependencies]
-nxapi = "0.3.0"
+nxapi = "0.4.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -165,8 +165,11 @@ acknowledgement. HTTP failures, malformed responses, and Cisco DME error objects
 even inside HTTP 200 fail the operation. `ApplyError.requests_completed` tells
 the caller how many prior requests were acknowledged. The failed request may
 have applied if its response was lost; changes are not transactional and there
-is no automatic retry or rollback. Error messages omit raw response text and
-credentials. Cisco error codes are retained.
+is no automatic retry or rollback. Transport errors include a category, HTTP
+method, sanitized device origin, relative API path and the underlying network or
+TLS cause chain. Error messages omit credentials, cookies, request/response
+bodies and URLs captured internally by the HTTP client. Cisco error codes are
+retained.
 
 `admin_state` reads configuration back, not operational link state. Automatic
 QoS readback, traffic validation, login renewal and persistence across device

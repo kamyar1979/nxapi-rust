@@ -645,13 +645,21 @@ async fn request_timeout_is_returned() {
     )
     .unwrap();
     c.set_session_cookie("APIC-cookie=abc").unwrap();
-    assert!(matches!(
-        c.apply(&throttle(Direction::Ingress))
-            .await
-            .unwrap_err()
-            .source,
-        Error::Transport(_)
-    ));
+    let error = c
+        .apply(&throttle(Direction::Ingress))
+        .await
+        .unwrap_err()
+        .source;
+    let message = error.to_string();
+    let Error::Transport(context) = error else {
+        panic!("expected transport error, got {message}");
+    };
+    assert_eq!(context.kind(), "timeout");
+    assert!(context.operation().contains("sending POST"));
+    assert!(context.operation().contains(&url));
+    assert!(message.contains("operation timed out"));
+    assert!(!message.contains("APIC-cookie"));
+    assert!(!message.contains("abc"));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use reqwest::{
     header::{COOKIE, HeaderValue},
 };
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{error::Error as StdError, fmt, time::Duration};
 use thiserror::Error;
 
 /// Failures from configuration, authentication or a single device request.
@@ -14,9 +14,10 @@ pub enum Error {
     /// Invalid endpoint, cookie or client options.
     #[error("invalid NX-API configuration: {0}")]
     Configuration(&'static str),
-    /// Network or TLS failure, with the request URL stripped.
+    /// Network or TLS failure with safe request context and the URL stripped
+    /// from the underlying HTTP error.
     #[error("NX-API transport failed: {0}")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),
     /// HTTP status outside the successful range.
     #[error("NX-API returned HTTP {0}")]
     Http(u16),
@@ -32,6 +33,45 @@ pub enum Error {
     /// The authenticated session is missing.
     #[error("NX-API authentication required; call login or set_session_cookie")]
     Unauthenticated,
+}
+
+/// A network, TLS, timeout, or response-body failure with safe request context.
+///
+/// Credentials, cookies, request bodies, and response bodies are never retained.
+#[derive(Debug)]
+pub struct TransportError {
+    kind: &'static str,
+    operation: String,
+    detail: String,
+    source: reqwest::Error,
+}
+
+impl TransportError {
+    /// Broad category suitable for logs and metrics.
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Safe operation description containing only method, sanitized origin and path.
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} while {}: {}",
+            self.kind, self.operation, self.detail
+        )
+    }
+}
+
+impl StdError for TransportError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Failure during an operation. Requests before this failure may have applied.
@@ -141,7 +181,7 @@ impl Client {
             .timeout(options.timeout)
             .tls_danger_accept_invalid_certs(options.insecure_skip_tls_verify)
             .build()
-            .map_err(transport)?;
+            .map_err(|error| transport(error, "building the HTTP client".into()))?;
         Ok(Self {
             http,
             origin,
@@ -436,6 +476,10 @@ impl Client {
             .origin
             .join(path)
             .map_err(|_| Error::Configuration("invalid generated path"))?;
+        let operation = format!(
+            "sending {method} {}{path}",
+            self.origin.as_str().trim_end_matches('/')
+        );
         let mut request = self
             .http
             .request(method, url)
@@ -449,12 +493,19 @@ impl Client {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let mut response = request.send().await.map_err(transport)?;
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| transport(error, operation.clone()))?;
         if !response.status().is_success() {
             return Err(Error::Http(response.status().as_u16()));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| transport(error, format!("reading the response to {operation}")))?
+        {
             if chunk.len() > self.options.max_response_bytes.saturating_sub(bytes.len()) {
                 return Err(Error::Response("response exceeded size limit"));
             }
@@ -470,8 +521,40 @@ impl Client {
     }
 }
 
-fn transport(error: reqwest::Error) -> Error {
-    Error::Transport(error.without_url())
+fn transport(error: reqwest::Error, operation: String) -> Error {
+    let source = error.without_url();
+    let kind = if source.is_timeout() {
+        "timeout"
+    } else if source.is_connect() {
+        "connection failure"
+    } else if source.is_body() {
+        "response body failure"
+    } else if source.is_decode() {
+        "response decoding failure"
+    } else if source.is_builder() {
+        "request construction failure"
+    } else if source.is_request() {
+        "request failure"
+    } else {
+        "transport failure"
+    };
+    let mut causes = Vec::new();
+    let mut current = source.source();
+    while let Some(cause) = current {
+        causes.push(cause.to_string());
+        current = cause.source();
+    }
+    let detail = if causes.is_empty() {
+        source.to_string()
+    } else {
+        causes.join(": ")
+    };
+    Error::Transport(TransportError {
+        kind,
+        operation,
+        detail,
+        source,
+    })
 }
 
 fn check_device_error(value: &Value) -> Result<(), Error> {
