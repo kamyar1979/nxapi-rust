@@ -293,7 +293,8 @@ async fn invalid_login_tokens_clear_session() {
     for token in ["", "bad;cookie=x", "bad token", "bad\r\ntoken"] {
         let (url, task) = server(vec![(
             200,
-            json!({"aaaLogin":{"attributes":{"token":token}}}).to_string(),
+            json!({"aaaLogin":{"attributes":{"token":token,"refreshTimeoutSeconds":"600"}}})
+                .to_string(),
         )])
         .await;
         let mut c = client(&url);
@@ -311,7 +312,7 @@ async fn login_block_unblock_and_readback_use_real_http() {
     let (url, task) = server(vec![
         (
             200,
-            json!({"imdata":[{"aaaLogin":{"attributes":{"token":"secret"}}}]}).to_string(),
+            json!({"imdata":[{"aaaLogin":{"attributes":{"token":"secret","refreshTimeoutSeconds":"600"}}}]}).to_string(),
         ),
         success(),
         success(),
@@ -360,10 +361,131 @@ async fn login_block_unblock_and_readback_use_real_http() {
 }
 
 #[tokio::test]
+async fn login_parses_timing_metadata_and_hides_secrets() {
+    let attrs = json!({
+        "token":"do-not-log-this-token",
+        "refreshTimeoutSeconds":"600",
+        "guiIdleTimeoutSeconds":"1200",
+        "restTimeoutSeconds":"0",
+        "creationTime":"1435631774",
+        "firstLoginTime":1435631775,
+        "userName":"operator",
+        "version":"10.6(1)",
+        "buildTime":"Tue Jun 23 04:05:41 PDT 2015",
+        "remoteUser":"false"
+    });
+    let (url, task) = server(vec![(
+        200,
+        json!({"imdata":[{"aaaLogin":{"attributes":attrs}}]}).to_string(),
+    )])
+    .await;
+    let mut c = Client::with_options(&url, options()).unwrap();
+    let metadata = c
+        .login("operator", "do-not-log-this-password")
+        .await
+        .unwrap();
+    assert_eq!(metadata.refresh_timeout_seconds, 600);
+    assert_eq!(metadata.gui_idle_timeout_seconds, Some(1200));
+    assert_eq!(metadata.rest_timeout_seconds, Some(0));
+    assert_eq!(metadata.creation_time, Some(1_435_631_774));
+    assert_eq!(metadata.first_login_time, Some(1_435_631_775));
+    assert_eq!(metadata.user_name.as_deref(), Some("operator"));
+    assert_eq!(metadata.version.as_deref(), Some("10.6(1)"));
+    assert_eq!(
+        metadata.build_time.as_deref(),
+        Some("Tue Jun 23 04:05:41 PDT 2015")
+    );
+    assert_eq!(metadata.remote_user, Some(false));
+    assert!(metadata.refresh_deadline > metadata.received_at);
+    assert!(!metadata.refresh_due());
+    assert!(!metadata.refresh_due_within(Duration::from_secs(30)));
+    assert!(format!("{metadata:?}").find("do-not-log-this").is_none());
+    assert!(format!("{c:?}").find("do-not-log-this").is_none());
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn login_requires_valid_refresh_timeout() {
+    for attributes in [
+        json!({"token":"abc"}),
+        json!({"token":"abc","refreshTimeoutSeconds":"soon"}),
+        json!({"token":"abc","refreshTimeoutSeconds":0}),
+    ] {
+        let (url, task) = server(vec![(
+            200,
+            json!({"aaaLogin":{"attributes":attributes}}).to_string(),
+        )])
+        .await;
+        let mut c = Client::with_options(&url, options()).unwrap();
+        assert!(matches!(
+            c.login("user", "password").await,
+            Err(Error::Response(_))
+        ));
+        assert!(c.session_metadata().is_none());
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn refresh_replaces_cookie_and_metadata_only_after_success() {
+    let (url, task) = server(vec![
+        (200, json!({"aaaLogin":{"attributes":{"token":"old-secret","refreshTimeoutSeconds":"60"}}}).to_string()),
+        (200, json!({"aaaRefresh":{"attributes":{"token":"new-secret","refreshTimeoutSeconds":"900","userName":"operator"}}}).to_string()),
+        (200, json!({"imdata":[{"l1PhysIf":{"attributes":{"adminSt":"up"}}}]}).to_string()),
+    ]).await;
+    let mut c = Client::with_options(&url, options()).unwrap();
+    c.login("user", "password").await.unwrap();
+    let refreshed = c.refresh().await.unwrap();
+    assert_eq!(refreshed.refresh_timeout_seconds, 900);
+    assert_eq!(c.session_metadata(), Some(&refreshed));
+    assert!(c.admin_state(&interface()).await.unwrap());
+    let requests = task.await.unwrap();
+    assert!(requests[1].head.starts_with("POST /api/aaaRefresh.json "));
+    assert!(requests[1].head.contains("APIC-cookie=old-secret"));
+    assert!(requests[1].body.is_null());
+    assert!(requests[2].head.contains("APIC-cookie=new-secret"));
+    assert!(!format!("{c:?}").contains("new-secret"));
+}
+
+#[tokio::test]
+async fn failed_refresh_preserves_session_but_explicit_unauthorized_clears_it() {
+    let (url, task) = server(vec![
+        (
+            200,
+            json!({"aaaLogin":{"attributes":{"token":"still-valid","refreshTimeoutSeconds":"60"}}})
+                .to_string(),
+        ),
+        (
+            200,
+            json!({"aaaLogin":{"attributes":{"token":"replacement"}}}).to_string(),
+        ),
+        (403, "{}".into()),
+    ])
+    .await;
+    let mut c = Client::with_options(&url, options()).unwrap();
+    c.login("user", "password").await.unwrap();
+    let prior = c.session_metadata().unwrap().clone();
+    assert!(matches!(c.refresh().await, Err(Error::Response(_))));
+    assert_eq!(c.session_metadata(), Some(&prior));
+    assert!(matches!(c.refresh().await, Err(Error::Http(403))));
+    assert!(c.session_metadata().is_none());
+    assert!(!format!("{c:?}").contains("still-valid"));
+    let requests = task.await.unwrap();
+    assert!(requests[1].head.contains("APIC-cookie=still-valid"));
+    assert!(requests[2].head.contains("APIC-cookie=still-valid"));
+}
+
+#[tokio::test]
+async fn refresh_without_session_fails_without_request() {
+    let mut c = Client::with_options("http://127.0.0.1:1", options()).unwrap();
+    assert!(matches!(c.refresh().await, Err(Error::Unauthenticated)));
+}
+
+#[tokio::test]
 async fn direct_login_response_is_supported() {
     let (url, task) = server(vec![(
         200,
-        json!({"aaaLogin":{"attributes":{"token":"abc"}}}).to_string(),
+        json!({"aaaLogin":{"attributes":{"token":"abc","refreshTimeoutSeconds":600}}}).to_string(),
     )])
     .await;
     Client::with_options(&url, options())

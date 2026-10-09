@@ -4,7 +4,11 @@ use reqwest::{
     header::{COOKIE, HeaderValue},
 };
 use serde_json::{Value, json};
-use std::{error::Error as StdError, fmt, time::Duration};
+use std::{
+    error::Error as StdError,
+    fmt,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 /// Failures from configuration, authentication or a single device request.
@@ -126,7 +130,57 @@ pub struct Client {
     http: reqwest::Client,
     origin: Url,
     cookie: Option<HeaderValue>,
+    session: Option<SessionMetadata>,
     options: ClientOptions,
+}
+
+/// Non-secret timing and identity metadata returned by Cisco `aaaLogin`.
+///
+/// The refresh deadline is calculated from a monotonic clock when the response
+/// is received; it is a local renewal hint, not proof the device still accepts
+/// the session. Session tokens and session IDs are intentionally not exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMetadata {
+    /// Monotonic instant at which the successful login response was received.
+    pub received_at: Instant,
+    /// Monotonic deadline derived from `refreshTimeoutSeconds`.
+    pub refresh_deadline: Instant,
+    /// Device-provided refresh timeout, in seconds.
+    pub refresh_timeout_seconds: u64,
+    /// Optional GUI idle timeout, in seconds.
+    pub gui_idle_timeout_seconds: Option<u64>,
+    /// Optional REST timeout, in seconds (`0` is retained as reported).
+    pub rest_timeout_seconds: Option<u64>,
+    /// Optional device session creation time (Unix seconds).
+    pub creation_time: Option<u64>,
+    /// Optional first-login time (Unix seconds).
+    pub first_login_time: Option<u64>,
+    /// Optional username reported by the device.
+    pub user_name: Option<String>,
+    /// Optional device software version.
+    pub version: Option<String>,
+    /// Optional device build timestamp.
+    pub build_time: Option<String>,
+    /// Whether the device marked this as a remote user session, when reported.
+    pub remote_user: Option<bool>,
+}
+
+impl SessionMetadata {
+    /// Whether the locally calculated refresh deadline has passed.
+    pub fn refresh_due(&self) -> bool {
+        Instant::now() >= self.refresh_deadline
+    }
+
+    /// Remaining time until the local refresh deadline, saturating at zero.
+    pub fn refresh_in(&self) -> Duration {
+        self.refresh_deadline
+            .saturating_duration_since(Instant::now())
+    }
+
+    /// Whether the local refresh deadline is within `margin` of now.
+    pub fn refresh_due_within(&self, margin: Duration) -> bool {
+        self.refresh_in() <= margin
+    }
 }
 
 impl std::fmt::Debug for Client {
@@ -187,10 +241,11 @@ impl Client {
             origin,
             options,
             cookie: None,
+            session: None,
         })
     }
 
-    /// Set a preauthenticated cookie, e.g. APIC-cookie=<token>.
+    /// Set a preauthenticated cookie, e.g. `APIC-cookie=token`.
     /// The caller owns session expiration and renewal.
     pub fn set_session_cookie(&mut self, cookie: &str) -> Result<(), Error> {
         if cookie.trim().is_empty() || !cookie.contains('=') {
@@ -200,13 +255,19 @@ impl Client {
             .map_err(|_| Error::Configuration("invalid cookie header"))?;
         header.set_sensitive(true);
         self.cookie = Some(header);
+        self.session = None;
         Ok(())
     }
 
     /// Authenticate via aaaLogin and retain the returned APIC session cookie.
     /// A failed login clears any previous session. Passwords are not stored.
-    pub async fn login(&mut self, username: &str, password: &str) -> Result<(), Error> {
+    pub async fn login(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<SessionMetadata, Error> {
         self.cookie = None;
+        self.session = None;
         if username.is_empty() || password.is_empty() {
             return Err(Error::Configuration(
                 "username and password must be nonempty",
@@ -220,17 +281,46 @@ impl Client {
                 false,
             )
             .await?;
-        let login = body.get("aaaLogin").or_else(|| {
-            body.get("imdata")
-                .and_then(Value::as_array)
-                .and_then(|items| items.iter().find_map(|i| i.get("aaaLogin")))
-        });
-        let token = login
-            .and_then(|v| v.pointer("/attributes/token"))
-            .and_then(Value::as_str)
-            .filter(|v| !v.is_empty() && !v.contains(';') && !v.chars().any(char::is_whitespace))
-            .ok_or(Error::Response("missing or invalid login token"))?;
-        self.set_session_cookie(&format!("APIC-cookie={token}"))
+        let (token, metadata) = parse_login_response(&body)?;
+        self.set_session_cookie(&format!("APIC-cookie={token}"))?;
+        self.session = Some(metadata.clone());
+        Ok(metadata)
+    }
+
+    /// Refresh the current device session using its existing cookie.
+    ///
+    /// Transient or malformed responses preserve the current cookie and
+    /// metadata. An explicit HTTP 401/403 clears them. Successful refresh
+    /// atomically replaces the cookie and timing metadata.
+    pub async fn refresh(&mut self) -> Result<SessionMetadata, Error> {
+        if self.cookie.is_none() {
+            return Err(Error::Unauthenticated);
+        }
+        let body = match self
+            .request(Method::POST, "/api/aaaRefresh.json", None, true)
+            .await
+        {
+            Ok(body) => body,
+            Err(error @ Error::Http(401 | 403)) => {
+                self.cookie = None;
+                self.session = None;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let (token, metadata) = parse_login_response(&body)?;
+        let mut cookie = HeaderValue::from_str(&format!("APIC-cookie={token}"))
+            .map_err(|_| Error::Response("invalid refreshed login token"))?;
+        cookie.set_sensitive(true);
+        self.cookie = Some(cookie);
+        self.session = Some(metadata.clone());
+        Ok(metadata)
+    }
+
+    /// Metadata for a login-established session, if available.
+    /// Manually supplied cookies have no device timing metadata.
+    pub fn session_metadata(&self) -> Option<&SessionMetadata> {
+        self.session.as_ref()
     }
 
     /// Define a new named class-default bandwidth policy without assigning it.
@@ -514,7 +604,10 @@ impl Client {
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| Error::Response("malformed JSON"))?;
         check_device_error(&value)?;
-        if authenticated && !value.get("imdata").is_some_and(Value::is_array) {
+        if authenticated
+            && path != "/api/aaaRefresh.json"
+            && !value.get("imdata").is_some_and(Value::is_array)
+        {
             return Err(Error::Response("missing imdata array"));
         }
         Ok(value)
@@ -555,6 +648,108 @@ fn transport(error: reqwest::Error, operation: String) -> Error {
         detail,
         source,
     })
+}
+
+fn parse_login_response(value: &Value) -> Result<(String, SessionMetadata), Error> {
+    let login = value
+        .get("aaaLogin")
+        .or_else(|| value.get("aaaRefresh"))
+        .or_else(|| {
+            value
+                .get("imdata")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find_map(|item| item.get("aaaLogin").or_else(|| item.get("aaaRefresh")))
+                })
+        });
+    let attributes = login
+        .and_then(|entry| entry.get("attributes"))
+        .and_then(Value::as_object)
+        .ok_or(Error::Response("missing login attributes"))?;
+    let token = attributes
+        .get("token")
+        .and_then(value_as_text)
+        .filter(|text| {
+            !text.is_empty() && !text.contains(';') && !text.chars().any(char::is_whitespace)
+        })
+        .ok_or(Error::Response("missing or invalid login token"))?
+        .to_owned();
+    let refresh_timeout_seconds = required_seconds(attributes, "refreshTimeoutSeconds")?;
+    if refresh_timeout_seconds == 0 {
+        return Err(Error::Response("invalid refreshTimeoutSeconds"));
+    }
+    let received_at = Instant::now();
+    let refresh_deadline = received_at
+        .checked_add(Duration::from_secs(refresh_timeout_seconds))
+        .ok_or(Error::Response("refreshTimeoutSeconds is out of range"))?;
+    let metadata = SessionMetadata {
+        received_at,
+        refresh_deadline,
+        refresh_timeout_seconds,
+        gui_idle_timeout_seconds: optional_seconds(attributes, "guiIdleTimeoutSeconds")?,
+        rest_timeout_seconds: optional_seconds(attributes, "restTimeoutSeconds")?,
+        creation_time: optional_seconds(attributes, "creationTime")?,
+        first_login_time: optional_seconds(attributes, "firstLoginTime")?,
+        user_name: optional_text(attributes, "userName")?,
+        version: optional_text(attributes, "version")?,
+        build_time: optional_text(attributes, "buildTime")?,
+        remote_user: optional_bool(attributes, "remoteUser")?,
+    };
+    Ok((token, metadata))
+}
+
+fn value_as_text(value: &Value) -> Option<&str> {
+    value.as_str()
+}
+
+fn required_seconds(
+    attributes: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<u64, Error> {
+    optional_seconds(attributes, key)?.ok_or(Error::Response("missing refreshTimeoutSeconds"))
+}
+
+fn optional_seconds(
+    attributes: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<u64>, Error> {
+    let Some(value) = attributes.get(key) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .ok_or(Error::Response("invalid login timing attribute"))?;
+    Ok(Some(parsed))
+}
+
+fn optional_text(
+    attributes: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<String>, Error> {
+    let Some(value) = attributes.get(key) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or(Error::Response("invalid login metadata attribute"))?;
+    Ok((!text.is_empty()).then(|| text.to_owned()))
+}
+
+fn optional_bool(
+    attributes: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<bool>, Error> {
+    let Some(value) = attributes.get(key) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .as_bool()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .ok_or(Error::Response("invalid login metadata attribute"))?;
+    Ok(Some(parsed))
 }
 
 fn check_device_error(value: &Value) -> Result<(), Error> {

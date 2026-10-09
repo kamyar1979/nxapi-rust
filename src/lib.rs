@@ -12,6 +12,8 @@ pub mod enforcement;
 pub mod policy;
 pub use policy::{BandwidthPolicy, InvalidPolicyName, PolicyName};
 
-pub use client::{ApplyError, ApplyReport, Client, ClientOptions, Error, TransportError};
+pub use client::{
+    ApplyError, ApplyReport, Client, ClientOptions, Error, SessionMetadata, TransportError,
+};
 
 pub use enforcement::{Direction, EnforcementOperation, EthernetInterface, InvalidInterface};

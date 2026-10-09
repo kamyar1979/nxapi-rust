@@ -1,19 +1,20 @@
 # nxapi
 
 Async Cisco Nexus **NX-API REST/DME** client for dedicated-interface enforcement.
-Version 0.2.0 added real HTTPS execution, authentication, Cisco response checking,
-and administrative-state readback. This is not the NX-API CLI/JSON-RPC interface.
+Version 0.5.0 adds typed login timing metadata and explicit session refresh.
+This is not the NX-API CLI/JSON-RPC interface.
 
 ## Install
 
-Version 0.4.0 adds contextual, safely redacted transport diagnostics. It retains
-the separate named-policy lifecycle methods and existing `apply` operations.
+Version 0.5.0 provides Cisco `aaaLogin` timing metadata, a monotonic refresh
+deadline, and `Client::refresh`. It retains safely redacted diagnostics, the
+separate named-policy lifecycle methods and existing `apply` operations.
 
-After publishing 0.4.0:
+After publishing 0.5.0:
 
 ```toml
 [dependencies]
-nxapi = "0.4.0"
+nxapi = "0.5.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -62,7 +63,18 @@ errors are propagated. All methods return `Result<(), Error>`.
 
 Existence/ownership checks are not atomic with writes. Serialize management
 operations with other writers. These methods never alter interface admin state.
-Login retains the returned APIC cookie; no duplicate login API is needed.
+Login retains the returned APIC cookie and returns `SessionMetadata`. Cisco
+requires `refreshTimeoutSeconds`; the client records its monotonic refresh
+deadline and parses optional GUI/REST timeouts, creation/first-login times,
+username and software version. Use `refresh_due_within(margin)` to schedule
+renewal before expiry, inspect the non-secret data via `session_metadata()`, or
+call `refresh()` to POST `aaaRefresh` without a body using the existing cookie.
+A successful refresh replaces cookie and metadata together; transient
+or malformed refresh failures preserve the current session, while HTTP 401/403
+clears it. A manually supplied cookie has no timing metadata. The deadline is a
+renewal hint, not proof that the device still accepts the session. Session
+tokens and IDs are never included in metadata/debug output. Passwords are not
+stored.
 
 ## Legacy per-interface convenience operations
 
