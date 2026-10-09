@@ -10,10 +10,12 @@ mod client;
 mod dme;
 pub mod enforcement;
 pub mod policy;
+mod session;
 pub use policy::{BandwidthPolicy, InvalidPolicyName, PolicyName};
 
 pub use client::{
-    ApplyError, ApplyReport, Client, ClientOptions, Error, SessionMetadata, TransportError,
+    ApplyError, ApplyReport, Client, ClientBuilder, Error, SessionMetadata, TransportError,
 };
+pub use session::{SessionStore, SessionStoreError, StoredSession};
 
 pub use enforcement::{Direction, EnforcementOperation, EthernetInterface, InvalidInterface};

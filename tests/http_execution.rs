@@ -1,11 +1,47 @@
-use nxapi::{Client, ClientOptions, Direction, EnforcementOperation as Op, Error};
+use async_trait::async_trait;
+use nxapi::{
+    Client, ClientBuilder, Direction, EnforcementOperation as Op, Error, SessionStore,
+    SessionStoreError, StoredSession,
+};
 use serde_json::{Value, json};
 use std::{num::NonZeroU64, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::watch,
     task::JoinHandle,
 };
+
+#[derive(Clone)]
+struct TestSessionStore(watch::Sender<Option<StoredSession>>);
+
+impl TestSessionStore {
+    fn new() -> Self {
+        let (sender, _) = watch::channel(None);
+        Self(sender)
+    }
+
+    fn saved(&self) -> Option<StoredSession> {
+        self.0.borrow().clone()
+    }
+}
+
+#[async_trait]
+impl SessionStore for TestSessionStore {
+    async fn load(&self, _: &str) -> Result<Option<StoredSession>, SessionStoreError> {
+        Ok(self.saved())
+    }
+
+    async fn save(&self, _: &str, session: &StoredSession) -> Result<(), SessionStoreError> {
+        self.0.send_replace(Some(session.clone()));
+        Ok(())
+    }
+
+    async fn delete(&self, _: &str) -> Result<(), SessionStoreError> {
+        self.0.send_replace(None);
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct Recorded {
@@ -67,15 +103,13 @@ async fn server(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<Record
     (origin, task)
 }
 
-fn options() -> ClientOptions {
-    ClientOptions {
-        allow_http: true,
-        policy_prefix: "pcef".into(),
-        ..Default::default()
-    }
+fn client_builder(origin: &str) -> ClientBuilder {
+    Client::builder(origin)
+        .allow_http(true)
+        .policy_prefix("pcef")
 }
 fn client(origin: &str) -> Client {
-    let mut c = Client::with_options(origin, options()).unwrap();
+    let mut c = client_builder(origin).build().unwrap();
     c.set_session_cookie("APIC-cookie=test-token").unwrap();
     c
 }
@@ -322,7 +356,7 @@ async fn login_block_unblock_and_readback_use_real_http() {
         ),
     ])
     .await;
-    let mut c = Client::with_options(&url, options()).unwrap();
+    let mut c = client_builder(&url).build().unwrap();
     c.login("operator", "password").await.unwrap();
     for enabled in [false, true] {
         assert_eq!(
@@ -379,7 +413,7 @@ async fn login_parses_timing_metadata_and_hides_secrets() {
         json!({"imdata":[{"aaaLogin":{"attributes":attrs}}]}).to_string(),
     )])
     .await;
-    let mut c = Client::with_options(&url, options()).unwrap();
+    let mut c = client_builder(&url).build().unwrap();
     let metadata = c
         .login("operator", "do-not-log-this-password")
         .await
@@ -416,7 +450,7 @@ async fn login_requires_valid_refresh_timeout() {
             json!({"aaaLogin":{"attributes":attributes}}).to_string(),
         )])
         .await;
-        let mut c = Client::with_options(&url, options()).unwrap();
+        let mut c = client_builder(&url).build().unwrap();
         assert!(matches!(
             c.login("user", "password").await,
             Err(Error::Response(_))
@@ -433,7 +467,7 @@ async fn refresh_replaces_cookie_and_metadata_only_after_success() {
         (200, json!({"aaaRefresh":{"attributes":{"token":"new-secret","refreshTimeoutSeconds":"900","userName":"operator"}}}).to_string()),
         (200, json!({"imdata":[{"l1PhysIf":{"attributes":{"adminSt":"up"}}}]}).to_string()),
     ]).await;
-    let mut c = Client::with_options(&url, options()).unwrap();
+    let mut c = client_builder(&url).build().unwrap();
     c.login("user", "password").await.unwrap();
     let refreshed = c.refresh().await.unwrap();
     assert_eq!(refreshed.refresh_timeout_seconds, 900);
@@ -445,6 +479,97 @@ async fn refresh_replaces_cookie_and_metadata_only_after_success() {
     assert!(requests[1].body.is_null());
     assert!(requests[2].head.contains("APIC-cookie=new-secret"));
     assert!(!format!("{c:?}").contains("new-secret"));
+}
+
+#[tokio::test]
+async fn builder_restores_saved_session_without_another_login() {
+    let (url, task) = server(vec![
+        (
+            200,
+            json!({"aaaLogin":{"attributes":{"token":"saved-secret","refreshTimeoutSeconds":"600"}}}).to_string(),
+        ),
+        success(),
+    ])
+    .await;
+    let store = TestSessionStore::new();
+    let mut first = Client::builder(&url)
+        .allow_http(true)
+        .timeout(Duration::from_secs(5))
+        .policy_prefix("pcef")
+        .max_response_bytes(1024 * 1024)
+        .session_store(store.clone(), "switch-1/operator")
+        .build()
+        .unwrap();
+    first.login("operator", "password").await.unwrap();
+    let saved = store.saved().unwrap();
+    assert_eq!(saved.cookie, "APIC-cookie=saved-secret");
+    assert!(!format!("{saved:?}").contains("saved-secret"));
+
+    let mut second = Client::builder(&url)
+        .allow_http(true)
+        .session_store(store, "switch-1/operator")
+        .build()
+        .unwrap();
+    second
+        .ensure_authenticated("operator", "password")
+        .await
+        .unwrap();
+    assert!(second.session_metadata().is_none());
+    second
+        .apply(&Op::SetAdminState {
+            interface: interface(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].head.contains("APIC-cookie=saved-secret"));
+}
+
+#[tokio::test]
+async fn stored_session_is_refreshed_and_replaced() {
+    let (url, task) = server(vec![
+        (
+            200,
+            json!({"aaaLogin":{"attributes":{"token":"old-secret","refreshTimeoutSeconds":"1"}}}).to_string(),
+        ),
+        (
+            200,
+            json!({"aaaRefresh":{"attributes":{"token":"new-secret","refreshTimeoutSeconds":"600"}}}).to_string(),
+        ),
+        success(),
+    ])
+    .await;
+    let store = TestSessionStore::new();
+    let mut first = Client::builder(&url)
+        .allow_http(true)
+        .session_store(store.clone(), "switch-1/operator")
+        .build()
+        .unwrap();
+    first.login("operator", "password").await.unwrap();
+
+    let mut second = Client::builder(&url)
+        .allow_http(true)
+        .session_store(store.clone(), "switch-1/operator")
+        .build()
+        .unwrap();
+    second
+        .ensure_authenticated("operator", "password")
+        .await
+        .unwrap();
+    assert_eq!(store.saved().unwrap().cookie, "APIC-cookie=new-secret");
+    second
+        .apply(&Op::SetAdminState {
+            interface: interface(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].head.contains("APIC-cookie=old-secret"));
+    assert!(requests[2].head.contains("APIC-cookie=new-secret"));
 }
 
 #[tokio::test]
@@ -462,7 +587,7 @@ async fn failed_refresh_preserves_session_but_explicit_unauthorized_clears_it() 
         (403, "{}".into()),
     ])
     .await;
-    let mut c = Client::with_options(&url, options()).unwrap();
+    let mut c = client_builder(&url).build().unwrap();
     c.login("user", "password").await.unwrap();
     let prior = c.session_metadata().unwrap().clone();
     assert!(matches!(c.refresh().await, Err(Error::Response(_))));
@@ -477,7 +602,7 @@ async fn failed_refresh_preserves_session_but_explicit_unauthorized_clears_it() 
 
 #[tokio::test]
 async fn refresh_without_session_fails_without_request() {
-    let mut c = Client::with_options("http://127.0.0.1:1", options()).unwrap();
+    let mut c = client_builder("http://127.0.0.1:1").build().unwrap();
     assert!(matches!(c.refresh().await, Err(Error::Unauthenticated)));
 }
 
@@ -488,7 +613,8 @@ async fn direct_login_response_is_supported() {
         json!({"aaaLogin":{"attributes":{"token":"abc","refreshTimeoutSeconds":600}}}).to_string(),
     )])
     .await;
-    Client::with_options(&url, options())
+    client_builder(&url)
+        .build()
         .unwrap()
         .login("user", "pass")
         .await
@@ -709,14 +835,7 @@ async fn malformed_missing_and_oversized_responses_fail() {
         task.await.unwrap();
     }
     let (url, task) = server(vec![success()]).await;
-    let mut c = Client::with_options(
-        &url,
-        ClientOptions {
-            max_response_bytes: 2,
-            ..options()
-        },
-    )
-    .unwrap();
+    let mut c = client_builder(&url).max_response_bytes(2).build().unwrap();
     c.set_session_cookie("APIC-cookie=abc").unwrap();
     assert!(matches!(
         c.apply(&throttle(Direction::Ingress))
@@ -758,14 +877,10 @@ async fn failed_login_clears_previous_session() {
 async fn request_timeout_is_returned() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let mut c = Client::with_options(
-        &url,
-        ClientOptions {
-            timeout: Duration::from_millis(50),
-            ..options()
-        },
-    )
-    .unwrap();
+    let mut c = client_builder(&url)
+        .timeout(Duration::from_millis(50))
+        .build()
+        .unwrap();
     c.set_session_cookie("APIC-cookie=abc").unwrap();
     let error = c
         .apply(&throttle(Direction::Ingress))
@@ -800,13 +915,9 @@ fn rejects_unsafe_configuration_and_headers() {
             .is_err()
     );
     assert!(
-        Client::with_options(
-            "https://192.0.2.1",
-            ClientOptions {
-                policy_prefix: "../x".into(),
-                ..Default::default()
-            }
-        )
-        .is_err()
+        Client::builder("https://192.0.2.1")
+            .policy_prefix("../x")
+            .build()
+            .is_err()
     );
 }

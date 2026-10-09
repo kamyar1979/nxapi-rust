@@ -1,4 +1,7 @@
-use crate::{BandwidthPolicy, Direction, EnforcementOperation, EthernetInterface, PolicyName, dme};
+use crate::{
+    BandwidthPolicy, Direction, EnforcementOperation, EthernetInterface, PolicyName, StoredSession,
+    dme, session::SessionStore,
+};
 use reqwest::{
     Method, Url,
     header::{COOKIE, HeaderValue},
@@ -7,7 +10,8 @@ use serde_json::{Value, json};
 use std::{
     error::Error as StdError,
     fmt,
-    time::{Duration, Instant},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
 
@@ -37,6 +41,9 @@ pub enum Error {
     /// The authenticated session is missing.
     #[error("NX-API authentication required; call login or set_session_cookie")]
     Unauthenticated,
+    /// Session persistence failed.
+    #[error("NX-API session storage failed: {0}")]
+    SessionStorage(#[source] crate::SessionStoreError),
 }
 
 /// A network, TLS, timeout, or response-body failure with safe request context.
@@ -96,9 +103,8 @@ pub struct ApplyReport {
     pub requests_completed: usize,
 }
 
-/// Connection and policy naming options.
 #[derive(Debug, Clone)]
-pub struct ClientOptions {
+struct ClientOptions {
     /// Per-request deadline, including reading the response body.
     pub timeout: Duration,
     /// Explicit lab opt-in to plain HTTP. Defaults to false.
@@ -124,6 +130,92 @@ impl Default for ClientOptions {
     }
 }
 
+/// Configures a client, optionally attaching a session store.
+pub struct ClientBuilder {
+    endpoint: String,
+    options: ClientOptions,
+    session_storage: Option<SessionStorage>,
+}
+
+impl ClientBuilder {
+    /// Set the per-request timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.options.timeout = timeout;
+        self
+    }
+
+    /// Explicitly allow HTTP for a lab endpoint.
+    pub fn allow_http(mut self, allow: bool) -> Self {
+        self.options.allow_http = allow;
+        self
+    }
+
+    /// Explicitly disable TLS certificate verification for a lab endpoint.
+    pub fn insecure_skip_tls_verify(mut self, skip: bool) -> Self {
+        self.options.insecure_skip_tls_verify = skip;
+        self
+    }
+
+    /// Set the prefix for SDK-owned policy maps.
+    pub fn policy_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.options.policy_prefix = prefix.into();
+        self
+    }
+
+    /// Set the maximum accepted response size in bytes.
+    pub fn max_response_bytes(mut self, maximum: usize) -> Self {
+        self.options.max_response_bytes = maximum;
+        self
+    }
+
+    /// Attach a store and a key unique to this device and login identity.
+    pub fn session_store<S: SessionStore + 'static>(
+        mut self,
+        store: S,
+        key: impl Into<String>,
+    ) -> Self {
+        self.session_storage = Some(SessionStorage {
+            store: Arc::new(store),
+            key: key.into(),
+        });
+        self
+    }
+
+    /// Attach a shared trait object when the store is already reference counted.
+    pub fn shared_session_store(
+        mut self,
+        store: Arc<dyn SessionStore>,
+        key: impl Into<String>,
+    ) -> Self {
+        self.session_storage = Some(SessionStorage {
+            store,
+            key: key.into(),
+        });
+        self
+    }
+
+    /// Validate the options and construct the client.
+    pub fn build(self) -> Result<Client, Error> {
+        if self
+            .session_storage
+            .as_ref()
+            .is_some_and(|storage| storage.key.is_empty())
+        {
+            return Err(Error::Configuration(
+                "session storage key must not be empty",
+            ));
+        }
+        let mut client = Client::build_with_options(&self.endpoint, self.options)?;
+        client.session_storage = self.session_storage;
+        Ok(client)
+    }
+}
+
+struct SessionStorage {
+    store: Arc<dyn SessionStore>,
+    key: String,
+}
+
 /// Async NX-API REST DME client. Reuses its HTTP connection pool and session.
 /// Redirects are refused. No automatic retries or rollback are performed.
 pub struct Client {
@@ -132,6 +224,7 @@ pub struct Client {
     cookie: Option<HeaderValue>,
     session: Option<SessionMetadata>,
     options: ClientOptions,
+    session_storage: Option<SessionStorage>,
 }
 
 /// Non-secret timing and identity metadata returned by Cisco `aaaLogin`.
@@ -193,14 +286,21 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Construct a client for an HTTPS origin, e.g. https://192.0.2.10.
-    pub fn new(endpoint: &str) -> Result<Self, Error> {
-        Self::with_options(endpoint, ClientOptions::default())
+    /// Begin configuring a client with individual options and optional storage.
+    pub fn builder(endpoint: impl Into<String>) -> ClientBuilder {
+        ClientBuilder {
+            endpoint: endpoint.into(),
+            options: ClientOptions::default(),
+            session_storage: None,
+        }
     }
 
-    /// Construct a client with explicit transport settings.
-    /// Endpoint must be an origin with no credentials, query, fragment or path.
-    pub fn with_options(endpoint: &str, options: ClientOptions) -> Result<Self, Error> {
+    /// Construct a client for an HTTPS origin, e.g. https://192.0.2.10.
+    pub fn new(endpoint: &str) -> Result<Self, Error> {
+        Self::builder(endpoint).build()
+    }
+
+    fn build_with_options(endpoint: &str, options: ClientOptions) -> Result<Self, Error> {
         let origin = Url::parse(endpoint).map_err(|_| Error::Configuration("invalid endpoint"))?;
         if origin.host_str().is_none()
             || !origin.username().is_empty()
@@ -242,6 +342,7 @@ impl Client {
             options,
             cookie: None,
             session: None,
+            session_storage: None,
         })
     }
 
@@ -273,6 +374,13 @@ impl Client {
                 "username and password must be nonempty",
             ));
         }
+        if let Some(storage) = &self.session_storage {
+            storage
+                .store
+                .delete(&storage.key)
+                .await
+                .map_err(Error::SessionStorage)?;
+        }
         let body = self
             .request(
                 Method::POST,
@@ -282,7 +390,9 @@ impl Client {
             )
             .await?;
         let (token, metadata) = parse_login_response(&body)?;
-        self.set_session_cookie(&format!("APIC-cookie={token}"))?;
+        let cookie = format!("APIC-cookie={token}");
+        self.set_session_cookie(&cookie)?;
+        self.save_session(&cookie, &metadata).await?;
         self.session = Some(metadata.clone());
         Ok(metadata)
     }
@@ -304,17 +414,96 @@ impl Client {
             Err(error @ Error::Http(401 | 403)) => {
                 self.cookie = None;
                 self.session = None;
+                if let Some(storage) = &self.session_storage {
+                    storage
+                        .store
+                        .delete(&storage.key)
+                        .await
+                        .map_err(Error::SessionStorage)?;
+                }
                 return Err(error);
             }
             Err(error) => return Err(error),
         };
         let (token, metadata) = parse_login_response(&body)?;
-        let mut cookie = HeaderValue::from_str(&format!("APIC-cookie={token}"))
+        let cookie = format!("APIC-cookie={token}");
+        let mut header = HeaderValue::from_str(&cookie)
             .map_err(|_| Error::Response("invalid refreshed login token"))?;
-        cookie.set_sensitive(true);
-        self.cookie = Some(cookie);
+        header.set_sensitive(true);
+        self.save_session(&cookie, &metadata).await?;
+        self.cookie = Some(header);
         self.session = Some(metadata.clone());
         Ok(metadata)
+    }
+
+    /// Restore a previously saved cookie, if storage was configured and has one.
+    /// This does not check its deadline or contact the device; use
+    /// [`Self::ensure_authenticated`] for automatic refresh or login. Restored
+    /// cookies have no in-process [`SessionMetadata`].
+    pub async fn restore_session(&mut self) -> Result<bool, Error> {
+        let Some(storage) = &self.session_storage else {
+            return Ok(false);
+        };
+        let Some(saved) = storage
+            .store
+            .load(&storage.key)
+            .await
+            .map_err(Error::SessionStorage)?
+        else {
+            return Ok(false);
+        };
+        self.set_session_cookie(&saved.cookie)?;
+        Ok(true)
+    }
+
+    /// Use a saved session, refresh it near its deadline, or log in anew.
+    ///
+    /// This method does not serialize simultaneous callers on different clients.
+    /// A shared store needs separate coordination to guarantee a single login.
+    pub async fn ensure_authenticated(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<(), Error> {
+        if let Some(storage) = &self.session_storage
+            && let Some(saved) = storage
+                .store
+                .load(&storage.key)
+                .await
+                .map_err(Error::SessionStorage)?
+        {
+            self.set_session_cookie(&saved.cookie)?;
+            if saved.refresh_at > SystemTime::now() + Duration::from_secs(30) {
+                return Ok(());
+            }
+            match self.refresh().await {
+                Ok(_) => return Ok(()),
+                Err(Error::Http(401 | 403)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.login(username, password).await?;
+        Ok(())
+    }
+
+    async fn save_session(&self, cookie: &str, metadata: &SessionMetadata) -> Result<(), Error> {
+        if let Some(storage) = &self.session_storage {
+            let refresh_at = SystemTime::now()
+                .checked_add(metadata.refresh_in())
+                .ok_or(Error::Response("session refresh time is out of range"))?;
+            storage
+                .store
+                .save(
+                    &storage.key,
+                    &StoredSession {
+                        cookie: cookie.to_owned(),
+                        refresh_at,
+                    },
+                )
+                .await
+                .map_err(Error::SessionStorage)?;
+        }
+        Ok(())
     }
 
     /// Metadata for a login-established session, if available.

@@ -1,20 +1,20 @@
 # nxapi
 
 Async Cisco Nexus **NX-API REST/DME** client for dedicated-interface enforcement.
-Version 0.5.0 adds typed login timing metadata and explicit session refresh.
+Version 0.6.0 adds a builder and an optional session-store contract.
 This is not the NX-API CLI/JSON-RPC interface.
 
 ## Install
 
-Version 0.5.0 provides Cisco `aaaLogin` timing metadata, a monotonic refresh
-deadline, and `Client::refresh`. It retains safely redacted diagnostics, the
-separate named-policy lifecycle methods and existing `apply` operations.
+Version 0.6.0 provides Cisco `aaaLogin` timing metadata, explicit refresh,
+and optional persistence of session cookies through the `SessionStore` trait.
+The builder configures transport and policy options individually.
 
-After publishing 0.5.0:
+After publishing 0.6.0:
 
 ```toml
 [dependencies]
-nxapi = "0.5.0"
+nxapi = "0.6.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -34,7 +34,10 @@ Use these methods for pre-provisioned policies shared by multiple interfaces:
 use nxapi::{Client, BandwidthPolicy, Direction};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let mut client = Client::new("https://192.0.2.10:443")?;
+let mut client = Client::builder("https://192.0.2.10:443")
+    .timeout(std::time::Duration::from_secs(5))
+    .policy_prefix("pcef")
+    .build()?;
 client.login(&std::env::var("NXAPI_USERNAME")?,
              &std::env::var("NXAPI_PASSWORD")?).await?;
 let name = "quota-10m".parse()?;
@@ -75,6 +78,15 @@ clears it. A manually supplied cookie has no timing metadata. The deadline is a
 renewal hint, not proof that the device still accepts the session. Session
 tokens and IDs are never included in metadata/debug output. Passwords are not
 stored.
+
+To persist a session, implement `SessionStore` and attach it with
+`Client::builder(endpoint).session_store(store, key).build()`. The key must
+identify the device and login account. The store receives a sensitive cookie
+and a wall-clock refresh deadline. Call `ensure_authenticated(username,
+password)` to restore a saved cookie, refresh it near the deadline, or log in.
+For an already shared `Arc<dyn SessionStore>`, use `shared_session_store`.
+Storage alone does not serialize simultaneous logins across processes; a
+distributed coordinator is required if that guarantee is needed.
 
 ## Legacy per-interface convenience operations
 
@@ -149,7 +161,7 @@ This request sequence is covered by mock HTTP tests; verify it on the target
 NX-OS release before production rollout. No live-switch verification is implied.
 
 Policy names are `nxapi-eth1-10-in` / `nxapi-eth1-10-out`. Set
-`ClientOptions.policy_prefix = "pcef".into()` when adopting existing PCEF
+`.policy_prefix("pcef")` on the client builder when adopting existing PCEF
 policers so removal/update addresses the same objects.
 
 The caller must own a dedicated customer port and its QoS attachment; applying
@@ -167,7 +179,7 @@ in the target lab; an HTTP acknowledgement alone does not prove traffic limiting
 
 The client reuses its connection pool. HTTPS certificate verification is enabled
 by default; redirects are always rejected to avoid forwarding credentials.
-`ClientOptions` allows a per-request timeout (30s default), response size limit
+The client builder allows a per-request timeout (30s default), response size limit
 (1 MiB default), explicit plain HTTP for labs, and explicit TLS verification
 bypass. A device endpoint must be an origin; paths, embedded credentials,
 queries and fragments are rejected.
