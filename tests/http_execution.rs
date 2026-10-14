@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nxapi::{
-    Client, ClientBuilder, Direction, EnforcementOperation as Op, Error, SessionStore,
-    SessionStoreError, StoredSession,
+    Client, ClientBuilder, Direction, EnforcementOperation as Op, Error, IpMatch, IpQosClassifier,
+    SessionStore, SessionStoreError, StoredSession,
 };
 use serde_json::{Value, json};
 use std::{num::NonZeroU64, time::Duration};
@@ -143,6 +143,211 @@ fn policy_present() -> (u16, String) {
         200,
         json!({"imdata":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m"}}}]}).to_string(),
     )
+}
+
+fn ip_policy_present(class_name: &str) -> (u16, String) {
+    (
+        200,
+        json!({"imdata":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m"},
+            "children":[{"ipqosMatchCMap":{"attributes":{"name":class_name},
+                "children":[{"ipqosPolice":{"attributes":{"cirRate":"10000000"}}}]}}]
+        }}]})
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn defines_ip_classified_policy_with_guarded_dme_writes() {
+    let (url, task) = server(vec![
+        success(),
+        success(),
+        success(),
+        success(),
+        success(),
+        success(),
+    ])
+    .await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let (name, policy) = named_policy();
+    let report = client(&url)
+        .define_ip_policy(&classifier, &name, &policy)
+        .await
+        .unwrap();
+    assert_eq!(report.requests_completed, 3);
+
+    let requests = task.await.unwrap();
+    assert!(
+        requests[0]
+            .head
+            .starts_with("GET /api/mo/sys/acl/ipv4/name-subscriber-42.json ")
+    );
+    assert!(
+        requests[1]
+            .head
+            .starts_with("GET /api/mo/sys/ipqos/dflt/c/name-subscriber-42.json ")
+    );
+    assert!(
+        requests[2]
+            .head
+            .starts_with("GET /api/mo/sys/ipqos/dflt/p/name-quota-10m.json ")
+    );
+    assert!(
+        requests[3]
+            .head
+            .starts_with("POST /api/mo/sys/acl/ipv4.json ")
+    );
+    let ace = &requests[3].body["ipv4aclAF"]["children"][0]["ipv4aclACL"]["children"][0]["ipv4aclACE"]
+        ["attributes"];
+    assert_eq!(ace["srcPrefix"], "192.0.2.42");
+    assert_eq!(ace["srcPrefixLength"], "32");
+    assert_eq!(ace["dstPrefixLength"], "0");
+    assert_eq!(ace["protocol"], "ip");
+    assert!(
+        requests[4]
+            .head
+            .starts_with("POST /api/mo/sys/ipqos/dflt/c/name-subscriber-42.json ")
+    );
+    assert_eq!(
+        requests[4].body["ipqosCMapInst"]["children"][0]["ipqosAcl"]["attributes"]["name"],
+        "subscriber-42"
+    );
+    let class = &requests[5].body["ipqosPMapEntity"]["children"][0]["ipqosPMapInst"]["children"][0]
+        ["ipqosMatchCMap"];
+    assert_eq!(class["attributes"]["name"], "subscriber-42");
+    assert_eq!(
+        class["children"][0]["ipqosPolice"]["attributes"]["cirRate"],
+        "10000000"
+    );
+}
+
+#[tokio::test]
+async fn ip_policy_reports_partial_mutation() {
+    let failure = (500, r#"{"imdata":[]}"#.into());
+    let (url, task) = server(vec![success(), success(), success(), success(), failure]).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-v6",
+        IpMatch::destination("2001:db8::42".parse().unwrap()),
+    )
+    .unwrap();
+    let (name, policy) = named_policy();
+    let error = client(&url)
+        .define_ip_policy(&classifier, &name, &policy)
+        .await
+        .unwrap_err();
+    assert_eq!(error.requests_completed, 1);
+    let requests = task.await.unwrap();
+    assert!(
+        requests[0]
+            .head
+            .starts_with("GET /api/mo/sys/acl/ipv6/name-subscriber-v6.json ")
+    );
+    let ace = &requests[3].body["ipv6aclAF"]["children"][0]["ipv6aclACL"]["children"][0]["ipv6aclACE"]
+        ["attributes"];
+    assert_eq!(ace["dstPrefix"], "2001:db8::42");
+    assert_eq!(ace["dstPrefixLength"], "128");
+    assert_eq!(ace["protocol"], "ipv6");
+}
+
+#[tokio::test]
+async fn ip_policy_refuses_any_object_at_exact_acl_name() {
+    let (url, task) = server(vec![(
+        200,
+        json!({"imdata":[{"unexpected":{}}]}).to_string(),
+    )])
+    .await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let (name, policy) = named_policy();
+    let error = client(&url)
+        .define_ip_policy(&classifier, &name, &policy)
+        .await
+        .unwrap_err();
+    assert_eq!(error.requests_completed, 0);
+    assert!(matches!(error.source, Error::Configuration(_)));
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .head
+            .starts_with("GET /api/mo/sys/acl/ipv4/name-subscriber-42.json ")
+    );
+}
+
+#[tokio::test]
+async fn edits_only_the_expected_named_ip_policy_class() {
+    let (url, task) = server(vec![ip_policy_present("subscriber-42"), success()]).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let (name, mut policy) = named_policy();
+    policy.rate_bps = NonZeroU64::new(25_000_000).unwrap();
+    policy.burst_bytes = None;
+    client(&url)
+        .edit_ip_policy(&classifier, &name, &policy)
+        .await
+        .unwrap();
+
+    let requests = task.await.unwrap();
+    assert!(
+        requests[0]
+            .head
+            .starts_with("GET /api/mo/sys/ipqos/dflt/p/name-quota-10m.json?rsp-subtree=children ")
+    );
+    let class = &requests[1].body["ipqosPMapEntity"]["children"][0]["ipqosPMapInst"]["children"][0]
+        ["ipqosMatchCMap"];
+    assert_eq!(class["attributes"]["name"], "subscriber-42");
+    assert_eq!(
+        class["children"][0]["ipqosPolice"]["attributes"]["cirRate"],
+        "25000000"
+    );
+    assert!(
+        class["children"][0]["ipqosPolice"]["attributes"]
+            .get("bcRate")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ip_policy_edit_refuses_wrong_or_extra_classes_without_writing() {
+    let wrong = ip_policy_present("unrelated");
+    let extra = (
+        200,
+        json!({"imdata":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m"},
+        "children":[
+            {"ipqosMatchCMap":{"attributes":{"name":"subscriber-42"}}},
+            {"ipqosMatchCMap":{"attributes":{"name":"unrelated"}}}
+        ]}}]})
+        .to_string(),
+    );
+    let (url, task) = server(vec![wrong, extra]).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let (name, policy) = named_policy();
+    let c = client(&url);
+    for _ in 0..2 {
+        assert!(matches!(
+            c.edit_ip_policy(&classifier, &name, &policy).await,
+            Err(Error::Configuration(_))
+        ));
+    }
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|request| request.head.starts_with("GET "))
+    );
 }
 
 #[tokio::test]

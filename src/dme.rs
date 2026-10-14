@@ -92,11 +92,15 @@ pub(crate) fn policy(
 }
 
 pub(crate) fn policer(name: &str, attributes: Value) -> Request {
+    named_policer(name, "class-default", attributes)
+}
+
+pub(crate) fn named_policer(name: &str, class_name: &str, attributes: Value) -> Request {
     Request {
         path: "/api/mo/sys/ipqos/dflt/p.json".into(),
         body: json!({"ipqosPMapEntity":{"children":[
             {"ipqosPMapInst":{"attributes":{"name":name,"matchType":"match-all"},"children":[
-                {"ipqosMatchCMap":{"attributes":{"name":"class-default","userSetBit":"1"},
+                {"ipqosMatchCMap":{"attributes":{"name":class_name,"userSetBit":"1"},
                     "children":[{"ipqosPolice":{"attributes":attributes}}]}}
             ]}}
         ]}}),

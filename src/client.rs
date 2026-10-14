@@ -1,6 +1,6 @@
 use crate::{
-    BandwidthPolicy, Direction, EnforcementOperation, EthernetInterface, PolicyName, StoredSession,
-    dme, session::SessionStore,
+    BandwidthPolicy, Direction, EnforcementOperation, EthernetInterface, IpQosClassifier,
+    PolicyName, StoredSession, dme, ipqos, session::SessionStore,
 };
 use reqwest::{
     Method, Url,
@@ -528,8 +528,84 @@ impl Client {
         self.write_policy(name, policy).await
     }
 
+    /// Define an ACL-classified bandwidth policy without assigning it.
+    ///
+    /// All three names are checked before mutation, so an existing ACL,
+    /// class-map, or policy-map is never overwritten. The checks are not
+    /// atomic; callers must serialize configuration writers. On failure,
+    /// [`ApplyError::requests_completed`] identifies how many of the ACL,
+    /// class-map, and policy-map writes were acknowledged. No automatic
+    /// cleanup is attempted.
+    pub async fn define_ip_policy(
+        &self,
+        classifier: &IpQosClassifier,
+        policy_name: &PolicyName,
+        policy: &BandwidthPolicy,
+    ) -> Result<ApplyReport, ApplyError> {
+        let checks = [
+            (ipqos::named_acl_path(classifier), "ACL already exists"),
+            (
+                ipqos::class_map_path(classifier),
+                "class-map already exists",
+            ),
+            (ipqos::policy_path(policy_name), "policy already exists"),
+        ];
+        for (path, message) in checks {
+            let body = self
+                .request(Method::GET, &path, None, true)
+                .await
+                .map_err(|source| ApplyError {
+                    requests_completed: 0,
+                    source,
+                })?;
+            if dme_object_exists(&body).map_err(|source| ApplyError {
+                requests_completed: 0,
+                source,
+            })? {
+                return Err(ApplyError {
+                    requests_completed: 0,
+                    source: Error::Configuration(message),
+                });
+            }
+        }
+
+        let mut police = json!({"cirRate":policy.rate_bps.to_string(),"cirUnit":"bps",
+            "conformAction":"transmit","exceedAction":"unspecified"});
+        if let Some(burst) = policy.burst_bytes {
+            police["bcRate"] = json!(burst.to_string());
+            police["bcUnit"] = json!("bytes");
+        }
+        let policy_request = dme::named_policer(policy_name.as_str(), &classifier.name, police);
+        let writes = [
+            (
+                ipqos::acl_path(classifier.address.address).to_owned(),
+                ipqos::acl_payload(classifier),
+            ),
+            (
+                ipqos::class_map_path(classifier),
+                ipqos::class_map_payload(classifier),
+            ),
+            (policy_request.path, policy_request.body),
+        ];
+        let mut completed = 0;
+        for (path, body) in writes {
+            self.request(Method::POST, &path, Some(body), true)
+                .await
+                .map_err(|source| ApplyError {
+                    requests_completed: completed,
+                    source,
+                })?;
+            completed += 1;
+        }
+        Ok(ApplyReport {
+            requests_completed: completed,
+        })
+    }
+
     /// Edit an existing policy's class-default policer without changing assignments.
     /// This affects every interface using the policy. None for burst preserves it.
+    /// Do not use this for a policy created by [`Self::define_ip_policy`]: its
+    /// policer belongs to a named class rather than `class-default`.
     /// Fails if absent; callers must serialize edits with other policy writers.
     pub async fn edit_policy(
         &self,
@@ -540,6 +616,62 @@ impl Client {
             return Err(Error::Configuration("policy does not exist"));
         }
         self.write_policy(name, policy).await
+    }
+
+    /// Edit the policer on the named class of an IP-classified policy.
+    ///
+    /// The policy map must contain exactly the expected class-map reference;
+    /// `class-default` is never changed. This affects every interface to which
+    /// the policy is assigned. A missing burst value leaves the existing burst
+    /// setting unchanged. Callers must serialize configuration writers.
+    pub async fn edit_ip_policy(
+        &self,
+        classifier: &IpQosClassifier,
+        name: &PolicyName,
+        policy: &BandwidthPolicy,
+    ) -> Result<(), Error> {
+        // DME defaults rsp-subtree to "no", so the named class is absent
+        // unless children are requested explicitly.
+        let path = format!("{}?rsp-subtree=children", ipqos::policy_path(name));
+        let body = self.request(Method::GET, &path, None, true).await?;
+        let items = body["imdata"]
+            .as_array()
+            .ok_or(Error::Response("missing policy data"))?;
+        if items.len() != 1 {
+            return Err(Error::Configuration(
+                "IP policy does not exist or is ambiguous",
+            ));
+        }
+        let map = items[0]
+            .get("ipqosPMapInst")
+            .ok_or(Error::Response("unexpected policy data"))?;
+        if map.pointer("/attributes/name").and_then(Value::as_str) != Some(name.as_str()) {
+            return Err(Error::Response("unexpected policy name"));
+        }
+        let children = map["children"]
+            .as_array()
+            .ok_or(Error::Response("missing policy classes"))?;
+        if children.len() != 1
+            || children[0]
+                .pointer("/ipqosMatchCMap/attributes/name")
+                .and_then(Value::as_str)
+                != Some(classifier.name.as_str())
+        {
+            return Err(Error::Configuration(
+                "policy is not the expected SDK IP policy",
+            ));
+        }
+
+        let mut police = json!({"cirRate":policy.rate_bps.to_string(),"cirUnit":"bps",
+            "conformAction":"transmit","exceedAction":"unspecified"});
+        if let Some(burst) = policy.burst_bytes {
+            police["bcRate"] = json!(burst.to_string());
+            police["bcUnit"] = json!("bytes");
+        }
+        let request = dme::named_policer(name.as_str(), &classifier.name, police);
+        self.request(Method::POST, &request.path, Some(request.body), true)
+            .await?;
+        Ok(())
     }
 
     /// Delete a named policy definition, never implicitly unassigning interfaces.
@@ -801,6 +933,13 @@ impl Client {
         }
         Ok(value)
     }
+}
+
+fn dme_object_exists(body: &Value) -> Result<bool, Error> {
+    let items = body["imdata"]
+        .as_array()
+        .ok_or(Error::Response("missing DME object data"))?;
+    Ok(!items.is_empty())
 }
 
 fn transport(error: reqwest::Error, operation: String) -> Error {

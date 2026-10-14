@@ -175,6 +175,22 @@ The DME policer uses `conformAction=transmit` and
 Device default exceed behavior and effective hardware policing must be checked
 in the target lab; an HTTP acknowledgement alone does not prove traffic limiting.
 
+For shared-port IP classification, `define_ip_policy` creates a host ACL, a QoS
+class-map referencing it, and a policy-map with a policer on that named class.
+`edit_ip_policy` verifies that exact single-class relationship before changing
+the named-class policer. The policy must still be attached to an interface with
+`assign_policy`; defining it alone does not affect traffic. A source-address
+classifier matches packets whose source is the subscriber IP, while a
+destination-address classifier matches packets whose destination is that IP.
+These packet semantics are independent of interface ingress/egress: callers
+must choose both the endpoint and attachment direction for their topology.
+
+Classifier deletion is intentionally not automated. Cisco documents the named
+ACL and class-map DNs and DME deletion convention, but the SDK cannot prove that
+another policy does not reference those globally named objects. Safely stop
+enforcement with `unassign_policy`; remove classifier objects only through a
+separate configuration owner that can perform complete reference discovery.
+
 ## Transport and errors
 
 The client reuses its connection pool. HTTPS certificate verification is enabled
@@ -222,6 +238,8 @@ and administrative readback. These do not substitute for a live Nexus lab test.
 - [Interface state](https://developer.cisco.com/docs/cisco-nexus-3000-and-9000-series-nx-api-rest-sdk-user-guide-and-api-reference-release-9-2x/configuring-an-ethernet-interface/)
 - [Policing and removal](https://developer.cisco.com/docs/cisco-nexus-3000-and-9000-series-nx-api-rest-sdk-user-guide-and-api-reference/latest/configuring-qos-policy-maps/)
 - [Policy attachment](https://developer.cisco.com/docs/nx-os-n3k-n9k-api-ref-7-x/configuring-qos/)
+- [IPv4 and IPv6 ACLs](https://developer.cisco.com/docs/cisco-nexus-3000-and-9000-series-nx-api-rest-sdk-user-guide-and-api-reference/latest/configuring-ipv4-and-ipv6-acls/)
+- [QoS class maps](https://developer.cisco.com/docs/cisco-nexus-3000-and-9000-series-nx-api-rest-sdk-user-guide-and-api-reference/latest/configuring-qos-class-maps/)
 
 ## License
 

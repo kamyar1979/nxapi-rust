@@ -9,6 +9,7 @@
 mod client;
 mod dme;
 pub mod enforcement;
+pub mod ipqos;
 pub mod policy;
 mod session;
 pub use policy::{BandwidthPolicy, InvalidPolicyName, PolicyName};
@@ -19,3 +20,6 @@ pub use client::{
 pub use session::{SessionStore, SessionStoreError, StoredSession};
 
 pub use enforcement::{Direction, EnforcementOperation, EthernetInterface, InvalidInterface};
+pub use ipqos::{
+    InvalidClassifierName, InvalidIpAddress, IpAddress, IpEndpoint, IpMatch, IpQosClassifier,
+};
