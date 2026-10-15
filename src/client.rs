@@ -521,11 +521,78 @@ impl Client {
         policy: &BandwidthPolicy,
     ) -> Result<(), Error> {
         if self.policy_exists(name).await? {
+            // A retry after an acknowledged write is a successful desired-state
+            // reconciliation.  Never overwrite a definition we cannot prove is
+            // the one requested by this call.
+            if self.policy_matches(name, policy).await? {
+                return Ok(());
+            }
             return Err(Error::Configuration(
-                "policy already exists; use edit_policy",
+                "policy already exists with different settings",
             ));
         }
         self.write_policy(name, policy).await
+    }
+
+    async fn policy_matches(
+        &self,
+        name: &PolicyName,
+        policy: &BandwidthPolicy,
+    ) -> Result<bool, Error> {
+        let body = self
+            .request(
+                Method::GET,
+                &format!("{}?rsp-subtree=children", ipqos::policy_path(name)),
+                None,
+                true,
+            )
+            .await?;
+        let Some(items) = body["imdata"].as_array() else {
+            return Err(Error::Response("missing policy data"));
+        };
+        if items.len() != 1 {
+            return Ok(false);
+        }
+        let Some(map) = items[0].get("ipqosPMapInst") else {
+            return Ok(false);
+        };
+        if map.pointer("/attributes/name").and_then(Value::as_str) != Some(name.as_str())
+            || !matches!(
+                map.pointer("/attributes/matchType").and_then(Value::as_str),
+                Some("match-all" | "1")
+            )
+        {
+            return Ok(false);
+        }
+        let Some(children) = map.get("children").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        if children.len() != 1
+            || children[0]
+                .pointer("/ipqosMatchCMap/attributes/name")
+                .and_then(Value::as_str)
+                != Some("class-default")
+        {
+            return Ok(false);
+        }
+        let police = children[0].pointer("/ipqosMatchCMap/children/0/ipqosPolice/attributes");
+        let Some(attrs) = police else {
+            return Ok(false);
+        };
+        let rate = attrs.get("cirRate").and_then(Value::as_str);
+        let burst = attrs.get("bcRate").and_then(Value::as_str);
+        let expected_rate = policy.rate_bps.to_string();
+        let expected_burst = policy.burst_bytes.map(|b| b.to_string());
+        let actions_ok = attrs.get("cirUnit").and_then(Value::as_str) == Some("bps")
+            && attrs.get("conformAction").and_then(Value::as_str) == Some("transmit")
+            && attrs.get("exceedAction").and_then(Value::as_str) == Some("unspecified")
+            && (policy.burst_bytes.is_none()
+                || attrs.get("bcUnit").and_then(Value::as_str) == Some("bytes"));
+        Ok(
+            rate == Some(expected_rate.as_str())
+                && burst == expected_burst.as_deref()
+                && actions_ok,
+        )
     }
 
     /// Define an ACL-classified bandwidth policy without assigning it.
@@ -855,6 +922,9 @@ impl Client {
     /// Device rejection (including an in-use policy) is propagated unchanged.
     pub async fn remove_policy(&self, name: &PolicyName) -> Result<(), Error> {
         self.ensure_policy_unattached(name).await?;
+        if !self.policy_exists(name).await? {
+            return Ok(());
+        }
         self.request(
             Method::POST,
             "/api/mo/sys/ipqos/dflt/p.json",
@@ -879,6 +949,10 @@ impl Client {
     ) -> Result<(), Error> {
         if !self.policy_exists(name).await? {
             return Err(Error::Configuration("policy does not exist"));
+        }
+        let path = format!("{}/pmap.json", Self::assignment_path(interface, direction));
+        if self.owns_attachment(&path, name.as_str()).await? {
+            return Ok(());
         }
         self.write_assignment(name, interface, direction, false)
             .await

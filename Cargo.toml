@@ -1,6 +1,6 @@
 [package]
 name = "nxapi"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 description = "Typed Cisco NX-API enforcement SDK for OSS services"
 license = "Apache-2.0"

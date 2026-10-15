@@ -542,9 +542,11 @@ async fn separate_policy_lifecycle() {
             success(),
             policy_present(),
             success(),
+            success(),
             attachment("quota-10m"),
             success(),
             (200, json!({"totalCount":"0","imdata":[]}).to_string()),
+            policy_present(),
             success(),
         ])
         .await;
@@ -560,9 +562,10 @@ async fn separate_policy_lifecycle() {
         c.unassign_policy(&name, &interface(), direction)
             .await
             .unwrap();
-        c.remove_policy(&name).await.unwrap();
+        let removal = c.remove_policy(&name).await;
         let requests = task.await.unwrap();
-        assert_eq!(requests.len(), 10);
+        removal.unwrap();
+        assert_eq!(requests.len(), 12);
         assert!(
             requests[0]
                 .head
@@ -586,13 +589,13 @@ async fn separate_policy_lifecycle() {
                 assert!(attrs.get("bcRate").is_none());
             }
         }
-        for index in [5, 7] {
+        for index in [6, 8] {
             assert!(requests[index].head.starts_with(&format!(
                 "POST /api/mo/sys/ipqos/dflt/policy/{path_direction}/intf-[eth1/10].json "
             )));
             let attrs = &requests[index].body["ipqosIf"]["children"][0]["ipqosInst"]["attributes"];
             assert_eq!(attrs["name"], "quota-10m");
-            if index == 7 {
+            if index == 8 {
                 assert_eq!(attrs["status"], "deleted");
             } else {
                 assert_eq!(attrs["stats"], "yes");
@@ -600,7 +603,7 @@ async fn separate_policy_lifecycle() {
             assert!(requests[index].body.get("ipqosPMapEntity").is_none());
         }
         assert_eq!(
-            requests[9].body,
+            requests[11].body,
             json!({"ipqosPMapEntity":{"children":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m","status":"deleted"}}}]}})
         );
     }
@@ -613,6 +616,8 @@ async fn separate_policy_preconditions_prevent_writes() {
         policy_present(),
         success(),
         success(),
+        policy_present(),
+        attachment("unrelated"),
         attachment("unrelated"),
         success(),
         (200, json!({"imdata":[{}]}).to_string()),
@@ -740,6 +745,84 @@ async fn policy_removal_fails_closed_on_malformed_attachment_listing() {
         requests[0]
             .head
             .starts_with("GET /api/class/ipqosInst.json ")
+    );
+}
+
+#[tokio::test]
+async fn assign_same_attachment_is_idempotent() {
+    let (url, task) = server(vec![policy_present(), attachment("quota-10m")]).await;
+    client(&url)
+        .assign_policy(&named_policy().0, &interface(), Direction::Ingress)
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.head.starts_with("GET ")));
+}
+
+#[tokio::test]
+async fn assign_foreign_attachment_refuses_without_write() {
+    let (url, task) = server(vec![policy_present(), attachment("other")]).await;
+    assert!(matches!(
+        client(&url)
+            .assign_policy(&named_policy().0, &interface(), Direction::Ingress)
+            .await,
+        Err(Error::Configuration(_))
+    ));
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|r| r.head.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn remove_absent_policy_is_idempotent() {
+    let (url, task) = server(vec![
+        (200, json!({"totalCount":"0","imdata":[]}).to_string()),
+        success(),
+    ])
+    .await;
+    client(&url).remove_policy(&named_policy().0).await.unwrap();
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|r| r.head.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn define_conflicting_policy_refuses_without_write() {
+    let (url, task) = server(vec![policy_present(), policy_present()]).await;
+    assert!(matches!(
+        client(&url)
+            .define_policy(&named_policy().0, &named_policy().1)
+            .await,
+        Err(Error::Configuration(_))
+    ));
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|r| r.head.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn define_matching_policy_is_idempotent() {
+    let existing = json!({"imdata":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m","matchType":"match-all"},"children":[{"ipqosMatchCMap":{"attributes":{"name":"class-default"},"children":[{"ipqosPolice":{"attributes":{"cirRate":"10000000","cirUnit":"bps","bcRate":"8192","bcUnit":"bytes","conformAction":"transmit","exceedAction":"unspecified"}}}]}}]}}]}).to_string();
+    let (url, task) = server(vec![policy_present(), (200, existing)]).await;
+    client(&url)
+        .define_policy(&named_policy().0, &named_policy().1)
+        .await
+        .unwrap();
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|r| r.head.starts_with("GET "))
     );
 }
 
