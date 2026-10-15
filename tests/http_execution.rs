@@ -156,6 +156,188 @@ fn ip_policy_present(class_name: &str) -> (u16, String) {
     )
 }
 
+fn ip_classifier_preflight() -> Vec<(u16, String)> {
+    vec![
+        ip_policy_present("subscriber-42"),
+        (
+            200,
+            json!({"imdata":[{"ipqosCMapInst":{"attributes":{"name":"subscriber-42","matchType":"match-all"},
+                "children":[{"ipqosAcl":{"attributes":{"name":"subscriber-42"}}}]}}]})
+            .to_string(),
+        ),
+        (
+            200,
+            json!({"imdata":[{"ipv4aclACL":{"attributes":{"name":"subscriber-42"},
+            "children":[{"ipv4aclACE":{"attributes":{
+                "srcPrefix":"192.0.2.42","srcPrefixLength":"32",
+                "dstPrefix":"0.0.0.0","dstPrefixLength":"0","protocol":"ip",
+                "action":"permit","seqNum":"10"
+            }}}]}}]})
+            .to_string(),
+        ),
+        (200, json!({"totalCount":"0","imdata":[]}).to_string()),
+        (
+            200,
+            json!({"totalCount":"1","imdata":[{"ipqosMatchCMap":{"attributes":{
+                "name":"subscriber-42",
+                "dn":"sys/ipqos/dflt/p/name-quota-10m/cmap-subscriber-42"
+            }}}]})
+            .to_string(),
+        ),
+        (
+            200,
+            json!({"totalCount":"1","imdata":[{"ipqosAcl":{"attributes":{
+                "name":"subscriber-42",
+                "dn":"sys/ipqos/dflt/c/name-subscriber-42/acl-subscriber-42"
+            }}}]})
+            .to_string(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn removes_only_unattached_unshared_ip_policy_objects() {
+    let mut responses = ip_classifier_preflight();
+    responses.extend([success(), success(), success()]);
+    let (url, task) = server(responses).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let report = client(&url)
+        .remove_ip_policy(&classifier, &named_policy().0)
+        .await
+        .unwrap();
+    assert_eq!(report.requests_completed, 3);
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 9);
+    assert!(
+        requests[3]
+            .head
+            .starts_with("GET /api/class/ipqosInst.json ")
+    );
+    assert!(
+        requests[4]
+            .head
+            .starts_with("GET /api/class/ipqosMatchCMap.json ")
+    );
+    assert!(
+        requests[5]
+            .head
+            .starts_with("GET /api/class/ipqosAcl.json ")
+    );
+    assert!(
+        requests[6]
+            .head
+            .starts_with("POST /api/mo/sys/ipqos/dflt/p.json ")
+    );
+    assert!(
+        requests[7]
+            .head
+            .starts_with("POST /api/mo/sys/ipqos/dflt/c.json ")
+    );
+    assert!(
+        requests[8]
+            .head
+            .starts_with("POST /api/mo/sys/acl/ipv4.json ")
+    );
+}
+
+#[tokio::test]
+async fn ip_policy_removal_refuses_shared_classifier_without_writing() {
+    let mut responses = ip_classifier_preflight();
+    responses[4] = (
+        200,
+        json!({"totalCount":"1","imdata":[{"ipqosMatchCMap":{"attributes":{
+            "name":"subscriber-42",
+            "dn":"sys/ipqos/dflt/p/name-other-policy/cmap-subscriber-42"
+        }}}]})
+        .to_string(),
+    );
+    responses.truncate(5);
+    let (url, task) = server(responses).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let failure = client(&url)
+        .remove_ip_policy(&classifier, &named_policy().0)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.requests_completed, 0);
+    assert!(matches!(failure.source, Error::Configuration(_)));
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|request| request.head.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn ip_policy_removal_refuses_attached_policy_without_writing() {
+    let mut responses = ip_classifier_preflight();
+    responses[3] = (
+        200,
+        json!({"totalCount":"1","imdata":[{"ipqosInst":{"attributes":{"name":"quota-10m"}}}]})
+            .to_string(),
+    );
+    responses.truncate(4);
+    let (url, task) = server(responses).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let failure = client(&url)
+        .remove_ip_policy(&classifier, &named_policy().0)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.requests_completed, 0);
+    assert!(matches!(failure.source, Error::Configuration(_)));
+    assert!(
+        task.await
+            .unwrap()
+            .iter()
+            .all(|request| request.head.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn policy_removal_refuses_incomplete_attachment_listing() {
+    let (url, task) = server(vec![(
+        200,
+        json!({"totalCount":"2","imdata":[]}).to_string(),
+    )])
+    .await;
+    let failure = client(&url)
+        .remove_policy(&named_policy().0)
+        .await
+        .unwrap_err();
+    assert!(matches!(failure, Error::Response(_)));
+    assert_eq!(task.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ip_policy_removal_reports_partial_delete() {
+    let mut responses = ip_classifier_preflight();
+    responses.extend([success(), (500, json!({"imdata":[]}).to_string())]);
+    let (url, task) = server(responses).await;
+    let classifier = IpQosClassifier::new(
+        "subscriber-42",
+        IpMatch::source("192.0.2.42".parse().unwrap()),
+    )
+    .unwrap();
+    let failure = client(&url)
+        .remove_ip_policy(&classifier, &named_policy().0)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.requests_completed, 1);
+    assert_eq!(task.await.unwrap().len(), 8);
+}
+
 #[tokio::test]
 async fn defines_ip_classified_policy_with_guarded_dme_writes() {
     let (url, task) = server(vec![
@@ -362,6 +544,7 @@ async fn separate_policy_lifecycle() {
             success(),
             attachment("quota-10m"),
             success(),
+            (200, json!({"totalCount":"0","imdata":[]}).to_string()),
             success(),
         ])
         .await;
@@ -379,7 +562,7 @@ async fn separate_policy_lifecycle() {
             .unwrap();
         c.remove_policy(&name).await.unwrap();
         let requests = task.await.unwrap();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 10);
         assert!(
             requests[0]
                 .head
@@ -417,7 +600,7 @@ async fn separate_policy_lifecycle() {
             assert!(requests[index].body.get("ipqosPMapEntity").is_none());
         }
         assert_eq!(
-            requests[8].body,
+            requests[9].body,
             json!({"ipqosPMapEntity":{"children":[{"ipqosPMapInst":{"attributes":{"name":"quota-10m","status":"deleted"}}}]}})
         );
     }
@@ -515,6 +698,49 @@ async fn separate_policy_mutation_errors_are_returned() {
         Err(Error::Device { .. })
     ));
     assert_eq!(task.await.unwrap().len(), 9);
+}
+
+#[tokio::test]
+async fn policy_removal_refuses_attached_policy_without_writing() {
+    let (url, task) = server(vec![(
+        200,
+        json!({"totalCount":"1","imdata":[{"ipqosInst":{"attributes":{"name":"quota-10m"}}}]})
+            .to_string(),
+    )])
+    .await;
+    let error = client(&url)
+        .remove_policy(&named_policy().0)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Configuration(_)));
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .head
+            .starts_with("GET /api/class/ipqosInst.json ")
+    );
+}
+
+#[tokio::test]
+async fn policy_removal_fails_closed_on_malformed_attachment_listing() {
+    let (url, task) = server(vec![(
+        200,
+        json!({"totalCount":"1","imdata":[{"unexpected":{}}]}).to_string(),
+    )])
+    .await;
+    let error = client(&url)
+        .remove_policy(&named_policy().0)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Response(_)));
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .head
+            .starts_with("GET /api/class/ipqosInst.json ")
+    );
 }
 
 #[test]

@@ -21,5 +21,6 @@ pub use session::{SessionStore, SessionStoreError, StoredSession};
 
 pub use enforcement::{Direction, EnforcementOperation, EthernetInterface, InvalidInterface};
 pub use ipqos::{
-    InvalidClassifierName, InvalidIpAddress, IpAddress, IpEndpoint, IpMatch, IpQosClassifier,
+    InvalidClassifierMatch, InvalidClassifierName, InvalidIpAddress, IpAddress, IpEndpoint,
+    IpMatch, IpQosClassifier,
 };

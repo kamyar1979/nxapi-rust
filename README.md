@@ -26,9 +26,10 @@ Use these methods for pre-provisioned policies shared by multiple interfaces:
 | --- | --- |
 | `define_policy` | Create a named class-default policer; reject an existing name |
 | `edit_policy` | Update an existing policer; reject a missing name |
-| `remove_policy` | Delete the definition only; caller must unassign it everywhere first |
+| `remove_policy` | Delete the definition only after a switch-wide attachment check confirms it is unused |
 | `assign_policy` | Attach an existing policy to an interface/direction, replacing that slot |
 | `unassign_policy` | Detach the expected policy without deleting its definition |
+| `remove_ip_policy` | After ownership and reference checks, delete an IP policy-map, class-map, and ACL |
 
 ```rust,no_run
 use nxapi::{Client, BandwidthPolicy, Direction};
@@ -182,8 +183,21 @@ the named-class policer. The policy must still be attached to an interface with
 `assign_policy`; defining it alone does not affect traffic. A source-address
 classifier matches packets whose source is the subscriber IP, while a
 destination-address classifier matches packets whose destination is that IP.
-These packet semantics are independent of interface ingress/egress: callers
-must choose both the endpoint and attachment direction for their topology.
+The optional second match can constrain both source and destination, provided
+both addresses use the same IP family. These packet semantics are independent
+of interface ingress/egress: callers must choose both the endpoint and
+attachment direction for their topology.
+
+`remove_ip_policy` checks the exact policy, class-map, and ACL and queries
+switch-wide references before deleting them in that order. It refuses deletion
+when the policy is attached, a classifier is shared, or the reference query is
+incomplete or malformed. Checks and writes are not atomic; serialize writers
+and reconcile partial failures. These DME reads and deletion payloads require
+validation against the target NX-OS release in a Nexus lab.
+
+Only one QoS policy-map can occupy an interface/direction attachment slot.
+This API does not yet combine multiple customer IP classes into one shared-port
+policy-map; calling `assign_policy` for another policy replaces that slot.
 
 Classifier deletion is intentionally not automated. Cisco documents the named
 ACL and class-map DNs and DME deletion convention, but the SDK cannot prove that

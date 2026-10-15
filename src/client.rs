@@ -674,10 +674,187 @@ impl Client {
         Ok(())
     }
 
+    /// Remove an IP-classified policy and its dedicated class-map and ACL.
+    ///
+    /// The classifier must be the one used when defining the policy. This
+    /// operation first verifies all three objects and their references, and
+    /// refuses to write if the policy is attached or either classifier object
+    /// is shared. The checks and writes are not atomic: callers must serialize
+    /// configuration changes, and a failed later write leaves earlier deletes
+    /// in place. Device-specific DME behavior should be verified in a lab.
+    pub async fn remove_ip_policy(
+        &self,
+        classifier: &IpQosClassifier,
+        name: &PolicyName,
+    ) -> Result<ApplyReport, ApplyError> {
+        let preflight = async {
+            let policy = self
+                .request(
+                    Method::GET,
+                    &format!("{}?rsp-subtree=children", ipqos::policy_path(name)),
+                    None,
+                    true,
+                )
+                .await?;
+            let policy = one_dme_object(&policy, "ipqosPMapInst", name.as_str())?;
+            single_named_child(policy, "ipqosMatchCMap", &classifier.name)?;
+            let class = &policy["children"][0]["ipqosMatchCMap"];
+            if class
+                .get("children")
+                .and_then(Value::as_array)
+                .is_none_or(|children| {
+                    children.len() != 1 || children[0].get("ipqosPolice").is_none()
+                })
+            {
+                return Err(Error::Configuration("policy is not an IP policer"));
+            }
+
+            let class_map = self
+                .request(
+                    Method::GET,
+                    &format!("{}?rsp-subtree=children", ipqos::class_map_path(classifier)),
+                    None,
+                    true,
+                )
+                .await?;
+            let class_map = one_dme_object(&class_map, "ipqosCMapInst", &classifier.name)?;
+            single_named_child(class_map, "ipqosAcl", &classifier.name)?;
+            if !matches!(
+                class_map
+                    .pointer("/attributes/matchType")
+                    .and_then(Value::as_str),
+                Some("match-all" | "1")
+            ) {
+                return Err(Error::Configuration("class-map match type is unexpected"));
+            }
+
+            let acl = self
+                .request(
+                    Method::GET,
+                    &format!("{}?rsp-subtree=children", ipqos::named_acl_path(classifier)),
+                    None,
+                    true,
+                )
+                .await?;
+            verify_classifier_acl(&acl, classifier)?;
+
+            self.ensure_policy_unattached(name).await?;
+            self.ensure_unique_reference(
+                "ipqosMatchCMap",
+                &classifier.name,
+                &format!(
+                    "/ipqos/dflt/p/name-{}/cmap-{}",
+                    name.as_str(),
+                    classifier.name
+                ),
+            )
+            .await?;
+            self.ensure_unique_reference(
+                "ipqosAcl",
+                &classifier.name,
+                &format!(
+                    "/ipqos/dflt/c/name-{}/acl-{}",
+                    classifier.name, classifier.name
+                ),
+            )
+            .await
+        };
+        preflight.await.map_err(|source| ApplyError {
+            requests_completed: 0,
+            source,
+        })?;
+
+        let deletes = [
+            (
+                "/api/mo/sys/ipqos/dflt/p.json",
+                json!({"ipqosPMapEntity":{"children":[{"ipqosPMapInst":{"attributes":{"name":name.as_str(),"status":"deleted"}}}]}}),
+            ),
+            (
+                "/api/mo/sys/ipqos/dflt/c.json",
+                json!({"ipqosCMapEntity":{"children":[{"ipqosCMapInst":{"attributes":{"name":classifier.name,"status":"deleted"}}}]}}),
+            ),
+            (
+                ipqos::acl_path(classifier.address.address),
+                ipqos::acl_delete_payload(classifier),
+            ),
+        ];
+        for (completed, (path, body)) in deletes.into_iter().enumerate() {
+            self.request(Method::POST, path, Some(body), true)
+                .await
+                .map_err(|source| ApplyError {
+                    requests_completed: completed,
+                    source,
+                })?;
+        }
+        Ok(ApplyReport {
+            requests_completed: 3,
+        })
+    }
+
+    async fn ensure_policy_unattached(&self, name: &PolicyName) -> Result<(), Error> {
+        let body = self
+            .request(Method::GET, "/api/class/ipqosInst.json", None, true)
+            .await?;
+        let items = complete_class_items(&body, "missing QoS attachment data")?;
+        for item in items {
+            let attached = item
+                .pointer("/ipqosInst/attributes/name")
+                .and_then(Value::as_str)
+                .ok_or(Error::Response("missing attached policy name"))?;
+            if attached == name.as_str() {
+                return Err(Error::Configuration(
+                    "refusing to delete an attached policy",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_unique_reference(
+        &self,
+        class: &str,
+        target_name: &str,
+        expected_dn_suffix: &str,
+    ) -> Result<(), Error> {
+        let body = self
+            .request(Method::GET, &format!("/api/class/{class}.json"), None, true)
+            .await?;
+        let items = complete_class_items(&body, "missing classifier reference data")?;
+        let mut owned = 0;
+        for item in items {
+            let attrs = item
+                .get(class)
+                .and_then(|value| value.get("attributes"))
+                .ok_or(Error::Response("invalid classifier reference data"))?;
+            let name = attrs
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or(Error::Response("missing classifier reference name"))?;
+            if name != target_name {
+                continue;
+            }
+            let dn = attrs
+                .get("dn")
+                .and_then(Value::as_str)
+                .ok_or(Error::Response("missing classifier reference DN"))?;
+            if !dn.ends_with(expected_dn_suffix) {
+                return Err(Error::Configuration(
+                    "classifier is shared by another policy",
+                ));
+            }
+            owned += 1;
+        }
+        if owned != 1 {
+            return Err(Error::Response("expected one owned classifier reference"));
+        }
+        Ok(())
+    }
+
     /// Delete a named policy definition, never implicitly unassigning interfaces.
     /// Caller must first unassign it everywhere and must own the definition.
     /// Device rejection (including an in-use policy) is propagated unchanged.
     pub async fn remove_policy(&self, name: &PolicyName) -> Result<(), Error> {
+        self.ensure_policy_unattached(name).await?;
         self.request(
             Method::POST,
             "/api/mo/sys/ipqos/dflt/p.json",
@@ -940,6 +1117,119 @@ fn dme_object_exists(body: &Value) -> Result<bool, Error> {
         .as_array()
         .ok_or(Error::Response("missing DME object data"))?;
     Ok(!items.is_empty())
+}
+
+fn dme_items<'a>(body: &'a Value, message: &'static str) -> Result<&'a Vec<Value>, Error> {
+    body.get("imdata")
+        .and_then(Value::as_array)
+        .ok_or(Error::Response(message))
+}
+
+fn complete_class_items<'a>(
+    body: &'a Value,
+    message: &'static str,
+) -> Result<&'a Vec<Value>, Error> {
+    let items = dme_items(body, message)?;
+    let count = body
+        .get("totalCount")
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(|value| value.parse::<usize>().ok())
+                .or_else(|| value.as_u64().and_then(|value| usize::try_from(value).ok()))
+        })
+        .ok_or(Error::Response("missing or invalid class query count"))?;
+    if count != items.len() {
+        return Err(Error::Response("incomplete class query response"));
+    }
+    Ok(items)
+}
+
+fn one_dme_object<'a>(
+    body: &'a Value,
+    class: &str,
+    expected_name: &str,
+) -> Result<&'a Value, Error> {
+    let items = dme_items(body, "missing DME object data")?;
+    if items.len() != 1 {
+        return Err(Error::Response("expected exactly one DME object"));
+    }
+    let object = items[0]
+        .get(class)
+        .ok_or(Error::Response("unexpected DME object class"))?;
+    if object.pointer("/attributes/name").and_then(Value::as_str) != Some(expected_name) {
+        return Err(Error::Response("unexpected DME object name"));
+    }
+    Ok(object)
+}
+
+fn single_named_child(parent: &Value, class: &str, expected_name: &str) -> Result<(), Error> {
+    let children = parent
+        .get("children")
+        .and_then(Value::as_array)
+        .ok_or(Error::Response("missing DME object children"))?;
+    if children.len() != 1
+        || children[0]
+            .get(class)
+            .and_then(|child| child.pointer("/attributes/name"))
+            .and_then(Value::as_str)
+            != Some(expected_name)
+    {
+        return Err(Error::Configuration("classifier ownership is ambiguous"));
+    }
+    Ok(())
+}
+
+fn verify_classifier_acl(body: &Value, classifier: &IpQosClassifier) -> Result<(), Error> {
+    let (class, entry) = if classifier.address.address.as_std().is_ipv4() {
+        ("ipv4aclACL", "ipv4aclACE")
+    } else {
+        ("ipv6aclACL", "ipv6aclACE")
+    };
+    let acl = one_dme_object(body, class, &classifier.name)?;
+    let actual = acl
+        .get("children")
+        .and_then(Value::as_array)
+        .and_then(|children| {
+            (children.len() == 1)
+                .then(|| children[0].get(entry))
+                .flatten()
+        })
+        .and_then(|entry| entry.get("attributes"))
+        .ok_or(Error::Response("unexpected classifier ACL entries"))?;
+    let expected = ipqos::acl_payload(classifier);
+    let expected = expected
+        .get(if classifier.address.address.as_std().is_ipv4() {
+            "ipv4aclAF"
+        } else {
+            "ipv6aclAF"
+        })
+        .and_then(|family| family.get("children"))
+        .and_then(Value::as_array)
+        .and_then(|children| children.first())
+        .and_then(|child| child.get(class))
+        .and_then(|acl| acl.get("children"))
+        .and_then(Value::as_array)
+        .and_then(|children| children.first())
+        .and_then(|child| child.get(entry))
+        .and_then(|entry| entry.get("attributes"))
+        .ok_or(Error::Response("invalid generated classifier ACL"))?;
+    for key in [
+        "srcPrefix",
+        "srcPrefixLength",
+        "dstPrefix",
+        "dstPrefixLength",
+        "protocol",
+        "action",
+        "seqNum",
+    ] {
+        if actual.get(key) != expected.get(key) {
+            return Err(Error::Configuration(
+                "classifier ACL differs from expected definition",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn transport(error: reqwest::Error, operation: String) -> Error {

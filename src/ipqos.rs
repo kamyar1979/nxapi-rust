@@ -71,6 +71,9 @@ pub struct IpQosClassifier {
     pub name: String,
     /// Address criterion.
     pub address: IpMatch,
+    /// Optional second endpoint criterion. When present it must be the
+    /// opposite endpoint and the same address family as `address`.
+    pub secondary: Option<IpMatch>,
 }
 
 impl IpQosClassifier {
@@ -85,9 +88,30 @@ impl IpQosClassifier {
         {
             return Err(InvalidClassifierName);
         }
-        Ok(Self { name, address })
+        Ok(Self {
+            name,
+            address,
+            secondary: None,
+        })
+    }
+
+    /// Add a destination/source criterion to this classifier. IPv4 and IPv6
+    /// ACLs cannot mix families, so mismatches are rejected.
+    pub fn with_match(mut self, extra: IpMatch) -> Result<Self, InvalidClassifierMatch> {
+        if extra.endpoint == self.address.endpoint
+            || extra.address.as_std().is_ipv4() != self.address.address.as_std().is_ipv4()
+        {
+            return Err(InvalidClassifierMatch);
+        }
+        self.secondary = Some(extra);
+        Ok(self)
     }
 }
+
+/// A second classifier criterion has the wrong endpoint or address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("classifier criteria must use opposite endpoints in the same IP family")]
+pub struct InvalidClassifierMatch;
 
 /// A classifier name is empty, too long, or contains unsupported characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -133,14 +157,38 @@ pub(crate) fn acl_payload(classifier: &IpQosClassifier) -> Value {
         IpAddr::V6(_) => "::",
     };
     let matched = any.to_string();
-    let (src, src_len, dst, dst_len) = match classifier.address.endpoint {
-        IpEndpoint::Source => (matched.as_str(), bits, unspecified, 0),
-        IpEndpoint::Destination => (unspecified, 0, matched.as_str(), bits),
+    let (mut src, mut src_len, mut dst, mut dst_len) = match classifier.address.endpoint {
+        IpEndpoint::Source => (matched.clone(), bits, unspecified.to_owned(), 0),
+        IpEndpoint::Destination => (unspecified.to_owned(), 0, matched.clone(), bits),
     };
+    if let Some(extra) = classifier.secondary {
+        let value = extra.address.as_std().to_string();
+        match extra.endpoint {
+            IpEndpoint::Source => {
+                src = value;
+                src_len = bits;
+            }
+            IpEndpoint::Destination => {
+                dst = value;
+                dst_len = bits;
+            }
+        }
+    }
     json!({(af):{"children":[{(acl):{"attributes":{"name":classifier.name},"children":[
         {(ace):{"attributes":{"action":"permit","srcPrefix":src,"srcPrefixLength":src_len.to_string(),
         "dstPrefix":dst,"dstPrefixLength":dst_len.to_string(),"protocol":protocol,"seqNum":"10"}}}
     ]}}]}})
+}
+
+pub(crate) fn acl_delete_payload(classifier: &IpQosClassifier) -> Value {
+    let (family, acl) = if classifier.address.address.as_std().is_ipv4() {
+        ("ipv4aclAF", "ipv4aclACL")
+    } else {
+        ("ipv6aclAF", "ipv6aclACL")
+    };
+    json!({(family):{"children":[{(acl):{"attributes":{
+        "name":classifier.name,"status":"deleted"
+    }}}]}})
 }
 
 pub(crate) fn class_map_payload(classifier: &IpQosClassifier) -> Value {
@@ -171,6 +219,37 @@ mod tests {
         assert!("not-an-ip".parse::<IpAddress>().is_err());
         assert!(
             IpQosClassifier::new("bad/name", IpMatch::source("192.0.2.1".parse().unwrap()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn renders_dual_source_destination_acl() {
+        let src = IpMatch::source("192.0.2.1".parse().unwrap());
+        let dst = IpMatch::destination("192.0.2.2".parse().unwrap());
+        let classifier = IpQosClassifier::new("both", src)
+            .unwrap()
+            .with_match(dst)
+            .unwrap();
+        let ace = &acl_payload(&classifier)["ipv4aclAF"]["children"][0]["ipv4aclACL"]["children"]
+            [0]["ipv4aclACE"]["attributes"];
+        assert_eq!(ace["srcPrefix"], "192.0.2.1");
+        assert_eq!(ace["dstPrefix"], "192.0.2.2");
+    }
+
+    #[test]
+    fn rejects_mixed_family_or_duplicate_endpoint() {
+        let src = IpMatch::source("192.0.2.1".parse().unwrap());
+        assert!(
+            IpQosClassifier::new("x", src)
+                .unwrap()
+                .with_match(IpMatch::destination("2001:db8::1".parse().unwrap()))
+                .is_err()
+        );
+        assert!(
+            IpQosClassifier::new("x", src)
+                .unwrap()
+                .with_match(IpMatch::source("192.0.2.2".parse().unwrap()))
                 .is_err()
         );
     }
