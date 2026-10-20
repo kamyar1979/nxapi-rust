@@ -1,7 +1,11 @@
 use async_trait::async_trait;
+use network_device::{
+    AdministrativeState, DriverConnector, InterfaceName, Run, SetInterfaceState, operation,
+};
 use nxapi::{
-    Client, ClientBuilder, Direction, EnforcementOperation as Op, Error, IpMatch, IpQosClassifier,
-    SessionStore, SessionStoreError, StoredSession,
+    AssignBandwidthPolicy, Client, ClientBuilder, DefineIpBandwidthPolicy, Direction,
+    EnforcementOperation as Op, Error, GetInterfaceState, IpAddress, IpMatch, IpQosClassifier,
+    NxapiAuthentication, NxapiConnector, SessionStore, SessionStoreError, StoredSession,
 };
 use serde_json::{Value, json};
 use std::{num::NonZeroU64, time::Duration};
@@ -128,6 +132,31 @@ fn success() -> (u16, String) {
     (200, r#"{"imdata":[]}"#.into())
 }
 
+#[tokio::test]
+async fn connector_authenticates_client_with_resolved_credentials() {
+    let (url, task) = server(vec![(
+        200,
+        json!({"imdata":[{"aaaLogin":{"attributes":{"token":"secret","refreshTimeoutSeconds":"600"}}}]}).to_string(),
+    )])
+    .await;
+    let target = client_builder(&url);
+
+    let client = NxapiConnector
+        .connect(
+            &target,
+            NxapiAuthentication::new("operator", "resolved-password"),
+        )
+        .await
+        .unwrap();
+
+    assert!(client.session_metadata().is_some());
+    let requests = task.await.unwrap();
+    assert_eq!(
+        requests[0].body,
+        json!({"aaaUser":{"attributes":{"name":"operator","pwd":"resolved-password"}}})
+    );
+}
+
 fn named_policy() -> (nxapi::PolicyName, nxapi::BandwidthPolicy) {
     (
         "quota-10m".parse().unwrap(),
@@ -136,6 +165,54 @@ fn named_policy() -> (nxapi::PolicyName, nxapi::BandwidthPolicy) {
             burst_bytes: NonZeroU64::new(8192),
         },
     )
+}
+
+#[tokio::test]
+async fn operational_edsl_sets_interface_state_through_existing_apply() {
+    let (url, task) = server(vec![success()]).await;
+    let client = client(&url);
+    let interface = InterfaceName::try_from("Ethernet1/10").unwrap();
+
+    let report = operation(SetInterfaceState::new(
+        interface,
+        AdministrativeState::Disabled,
+    ))
+    .run(&client)
+    .await
+    .unwrap();
+
+    assert_eq!(report.requests_completed, 1);
+    let records = task.await.unwrap();
+    assert!(
+        records[0]
+            .head
+            .starts_with("POST /api/mo/sys/intf/phys-[eth1/10].json ")
+    );
+    assert_eq!(records[0].body["l1PhysIf"]["attributes"]["adminSt"], "down");
+}
+
+#[tokio::test]
+async fn operational_edsl_reads_interface_state_through_existing_client() {
+    let response = json!({
+        "imdata": [{"l1PhysIf": {"attributes": {"adminSt": "up"}}}]
+    })
+    .to_string();
+    let (url, task) = server(vec![(200, response)]).await;
+    let client = client(&url);
+    let interface = InterfaceName::try_from("Ethernet1/10").unwrap();
+
+    let state = operation(GetInterfaceState::new(interface))
+        .run(&client)
+        .await
+        .unwrap();
+
+    assert_eq!(state, AdministrativeState::Enabled);
+    let records = task.await.unwrap();
+    assert!(
+        records[0]
+            .head
+            .starts_with("GET /api/mo/sys/intf/phys-[eth1/10].json ")
+    );
 }
 
 fn policy_present() -> (u16, String) {
@@ -404,6 +481,105 @@ async fn defines_ip_classified_policy_with_guarded_dme_writes() {
         class["children"][0]["ipqosPolice"]["attributes"]["cirRate"],
         "10000000"
     );
+}
+
+#[tokio::test]
+async fn operational_edsl_defines_and_assigns_ipv4_and_ipv6_classified_policies() {
+    for (classifier_name, address, family, acl_family, direction, suffix) in [
+        (
+            "subscriber-v4",
+            "192.0.2.42",
+            "ipv4",
+            "ipv4aclAF",
+            Direction::Ingress,
+            "in",
+        ),
+        (
+            "subscriber-v6",
+            "2001:db8::42",
+            "ipv6",
+            "ipv6aclAF",
+            Direction::Egress,
+            "out",
+        ),
+    ] {
+        let (url, task) = server(vec![
+            success(),        // ACL preflight
+            success(),        // class-map preflight
+            success(),        // policy-map preflight
+            success(),        // ACL creation
+            success(),        // class-map creation
+            success(),        // policy-map creation
+            policy_present(), // assignment policy preflight
+            success(),        // attachment preflight
+            success(),        // interface attachment
+        ])
+        .await;
+        let client = client(&url);
+        let (name, policy) = named_policy();
+        let classifier = IpQosClassifier::new(
+            classifier_name,
+            IpMatch::source(address.parse::<IpAddress>().unwrap()),
+        )
+        .unwrap();
+        let interface = interface();
+
+        operation(DefineIpBandwidthPolicy::new(
+            classifier,
+            name.clone(),
+            policy,
+        ))
+        .then(operation(AssignBandwidthPolicy::new(
+            name, interface, direction,
+        )))
+        .run(&client)
+        .await
+        .unwrap();
+
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 9);
+        assert!(
+            requests[3]
+                .head
+                .starts_with(&format!("POST /api/mo/sys/acl/{family}.json "))
+        );
+        let acl = &requests[3].body[acl_family]["children"][0];
+        let ace = &acl[if family == "ipv4" {
+            "ipv4aclACL"
+        } else {
+            "ipv6aclACL"
+        }]["children"][0][if family == "ipv4" {
+            "ipv4aclACE"
+        } else {
+            "ipv6aclACE"
+        }]["attributes"];
+        assert_eq!(ace["srcPrefix"], address);
+        assert_eq!(
+            ace["srcPrefixLength"],
+            if family == "ipv4" { "32" } else { "128" }
+        );
+        assert_eq!(
+            ace["protocol"],
+            if family == "ipv4" { "ip" } else { "ipv6" }
+        );
+        assert!(
+            requests[4]
+                .head
+                .starts_with("POST /api/mo/sys/ipqos/dflt/c/name-subscriber-")
+        );
+        assert!(
+            requests[5]
+                .head
+                .starts_with("POST /api/mo/sys/ipqos/dflt/p.json ")
+        );
+        assert!(requests[8].head.starts_with(&format!(
+            "POST /api/mo/sys/ipqos/dflt/policy/{suffix}/intf-[eth1/10].json "
+        )));
+        assert_eq!(
+            requests[8].body["ipqosIf"]["children"][0]["ipqosInst"]["attributes"]["name"],
+            "quota-10m"
+        );
+    }
 }
 
 #[tokio::test]

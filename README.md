@@ -1,22 +1,116 @@
 # nxapi
 
 Async Cisco Nexus **NX-API REST/DME** client for dedicated-interface enforcement.
-Version 0.6.0 adds a builder and an optional session-store contract.
 This is not the NX-API CLI/JSON-RPC interface.
+
+The client implements the operational eDSL from
+[`network-device`](https://crates.io/crates/network-device). Authentication,
+session restoration, and transport configuration remain client lifecycle;
+authenticated clients can execute and compose standard and NX-API-specific
+device operations.
 
 ## Install
 
-Version 0.6.0 provides Cisco `aaaLogin` timing metadata, explicit refresh,
-and optional persistence of session cookies through the `SessionStore` trait.
-The builder configures transport and policy options individually.
-
-After publishing 0.6.0:
+The crate provides Cisco `aaaLogin` timing metadata, explicit refresh, and
+optional persistence of session cookies through the `SessionStore` trait. The
+builder configures transport and policy options individually.
 
 ```toml
 [dependencies]
-nxapi = "0.6.0"
+network-device = "0.2.0"
+nxapi = "0.8.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+## Operational eDSL
+
+The activation service can retrieve credentials from Vault, authenticate the
+client, and then execute a credential-free operation program. The eDSL delegates
+to the same tested NX-API methods as the direct API:
+
+```rust,no_run
+use network_device::{
+    AdministrativeState, DriverConnector, InterfaceName, Run, SetInterfaceState, operation,
+};
+use nxapi::{
+    Client, Direction, EnforcementOperation, NxapiAuthentication, NxapiConnector,
+};
+use std::num::NonZeroU64;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+// The activation service obtains these values from Vault.
+let username = std::env::var("NXAPI_USERNAME")?;
+let password = std::env::var("NXAPI_PASSWORD")?;
+
+let target = Client::builder("https://192.0.2.10:443");
+let client = NxapiConnector
+    .connect(&target, NxapiAuthentication::new(username, password))
+    .await?;
+
+let interface = InterfaceName::try_from("Ethernet1/10")?;
+let nx_interface = "Ethernet1/10".parse()?;
+
+operation(SetInterfaceState::new(
+    interface,
+    AdministrativeState::Enabled,
+))
+.then(operation(EnforcementOperation::Throttle {
+    interface: nx_interface,
+    direction: Direction::Ingress,
+    rate_bps: NonZeroU64::new(10_000_000).expect("non-zero rate"),
+    burst_bytes: NonZeroU64::new(65_536),
+}))
+.run(&client)
+.await?;
+# Ok(())
+# }
+```
+
+Shared operations such as `SetInterfaceState` come from `network-device`.
+NX-API policy types remain in this crate because they encode Cisco DME
+ownership and attachment semantics. Policy definition, editing, assignment,
+unassignment, and IP-classified policy operations are also available as typed
+eDSL operations. Existing direct methods remain backward compatible.
+
+IP-address throttling uses the same typed operation path for IPv4 and IPv6:
+define the ACL-classified policy, then assign it to the interface and traffic
+direction. `IpMatch::source` and `IpMatch::destination` select the address side
+used by the generated ACL.
+
+```rust,no_run
+use network_device::{Run, operation};
+use nxapi::{
+    AssignBandwidthPolicy, BandwidthPolicy, DefineIpBandwidthPolicy, Direction,
+    IpAddress, IpMatch, IpQosClassifier, PolicyName,
+};
+use std::num::NonZeroU64;
+
+# async fn example(client: &nxapi::Client) -> Result<(), Box<dyn std::error::Error>> {
+let name: PolicyName = "quota-10m".parse()?;
+let classifier = IpQosClassifier::new(
+    "subscriber-42",
+    IpMatch::source("192.0.2.42".parse::<IpAddress>()?),
+)?;
+let policy = BandwidthPolicy {
+    rate_bps: NonZeroU64::new(10_000_000).expect("non-zero rate"),
+    burst_bytes: NonZeroU64::new(65_536),
+};
+let interface: nxapi::EthernetInterface = "Ethernet1/10".parse()?;
+
+operation(DefineIpBandwidthPolicy::new(classifier, name.clone(), policy))
+    .then(operation(AssignBandwidthPolicy::new(
+        name,
+        interface,
+        Direction::Ingress,
+    )))
+    .run(client)
+    .await?;
+# Ok(())
+# }
+```
+
+Use an IPv6 string instead of `192.0.2.42` to generate the corresponding IPv6
+ACL. The same `AssignBandwidthPolicy` operation supports ingress and egress.
 
 ## Reusable policy lifecycle
 

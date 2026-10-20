@@ -131,6 +131,7 @@ impl Default for ClientOptions {
 }
 
 /// Configures a client, optionally attaching a session store.
+#[derive(Clone)]
 pub struct ClientBuilder {
     endpoint: String,
     options: ClientOptions,
@@ -211,6 +212,7 @@ impl ClientBuilder {
     }
 }
 
+#[derive(Clone)]
 struct SessionStorage {
     store: Arc<dyn SessionStore>,
     key: String,
