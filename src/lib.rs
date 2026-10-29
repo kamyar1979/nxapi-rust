@@ -1,16 +1,18 @@
 //! Cisco Nexus NX-API REST (DME) enforcement client.
 //!
 //! Execute typed interface administration and bandwidth policing operations.
-//! Callers own customer identity, inventory resolution and OSS event mapping.
+//! Callers decide what to configure; this crate only talks to the switch.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod access;
 mod client;
 mod connector;
 mod dme;
 pub mod enforcement;
 pub mod ipqos;
+mod neutral;
 mod operation;
 pub mod policy;
 mod session;
@@ -29,6 +31,6 @@ pub use ipqos::{
 };
 pub use operation::{
     AssignBandwidthPolicy, DefineBandwidthPolicy, DefineIpBandwidthPolicy, DriverError,
-    EditBandwidthPolicy, EditIpBandwidthPolicy, GetInterfaceState, RemoveBandwidthPolicy,
-    RemoveIpBandwidthPolicy, UnassignBandwidthPolicy,
+    EditBandwidthPolicy, EditIpBandwidthPolicy, RemoveBandwidthPolicy, RemoveIpBandwidthPolicy,
+    UnassignBandwidthPolicy,
 };

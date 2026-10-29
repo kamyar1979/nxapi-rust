@@ -1,13 +1,13 @@
-//! Interface-scoped operations, independent of OSS events and message routing.
+//! Interface-scoped operations.
 
 use std::{fmt, num::NonZeroU64, str::FromStr};
 
-/// Direction relative to the customer-facing switch port.
+/// Traffic direction on a switch interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    /// Customer upload: traffic entering the switch.
+    /// Traffic received on the interface.
     Ingress,
-    /// Customer download: traffic leaving the switch.
+    /// Traffic sent out of the interface.
     Egress,
 }
 
@@ -61,7 +61,7 @@ impl FromStr for EthernetInterface {
     }
 }
 
-/// Desired operation on a dedicated customer interface.
+/// Desired operation on one interface.
 ///
 /// Pass these operations to [crate::Client::apply]. The caller must ensure
 /// the port is dedicated and supports the requested policing direction.
@@ -69,14 +69,14 @@ impl FromStr for EthernetInterface {
 pub enum EnforcementOperation {
     /// Set the interface administrative state. Does not remove policing.
     SetAdminState {
-        /// Dedicated customer interface.
+        /// Interface to change.
         interface: EthernetInterface,
         /// Whether the interface should be administratively enabled.
         enabled: bool,
     },
     /// Create/update a policer and attach it in one direction.
     Throttle {
-        /// Dedicated customer interface whose QoS attachment the caller owns.
+        /// Interface whose QoS attachment the caller owns.
         interface: EthernetInterface,
         /// Ingress or egress; support must be checked independently.
         direction: Direction,
@@ -88,7 +88,7 @@ pub enum EnforcementOperation {
     /// Detach and delete the SDK-owned policy map in one direction.
     /// Leaves link state unchanged; refuses to detach another policy.
     RemoveThrottle {
-        /// Dedicated customer interface.
+        /// Interface to change.
         interface: EthernetInterface,
         /// Direction whose SDK-owned restriction should be removed.
         direction: Direction,

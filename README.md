@@ -17,14 +17,39 @@ builder configures transport and policy options individually.
 
 ```toml
 [dependencies]
-network-device = "0.2.0"
-nxapi = "0.8.0"
+network-device = "0.5.0"
+nxapi = "0.9.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
+## Vendor-neutral driver
+
+`Client` implements every `network-device` operation, so it is a
+`network_device::NeutralDriver` and, through it, a `DynDriver` that callers
+can select at run time. The neutral operations map onto the switch like this:
+
+| Neutral operation | On the switch |
+| --- | --- |
+| `EnsureBandwidthPolicy` (policy `P`) | Policy maps `P-in` and `P-out`, each one `class-default` policer; only a direction that differs is written, and a direction without a limit is removed |
+| `RemoveBandwidthPolicy` | Both maps removed; refused while attached |
+| `AttachBandwidthPolicy` / `DetachBandwidthPolicy`, interface scope | `P-in`/`P-out` attached to (detached from) the interface; another policy already attached is refused |
+| `SetInterfaceBandwidthLimit` / `RemoveInterfaceBandwidthLimit` | The per-interface throttle (`<prefix>-<interface>-in`/`-out`) |
+| `GetInterfaceState`, `GetBandwidthPolicy`, `GetInterfacePolicies`, `GetAccessList` | Read back from the DME |
+| `EnsureAccessList` / `RemoveAccessList` (list `N`) | One ACL `N` per address family it uses, plus class map `N` when attached; written in one request per family, only when it differs. Removal refuses while a policy map uses `N` |
+| `AttachBandwidthPolicy` / `DetachBandwidthPolicy`, access-list scope `N` | Class `N`, policed at `P`'s rate, in the policy map `P-<interface>-in`/`-out`, which is attached to the interface; the map holds one class per list and is removed with its last class. Ensuring `P` keeps these rates in sync |
+| `SetInterfaceDescription`, static routes | Not implemented yet: `ErrorKind::Unsupported` |
+
+A neutral policy name must leave room for the `-in`/`-out` suffix within the
+39 characters NX-OS allows. Every write reads first and writes only what
+differs. `DriverError` implements `network_device::DeviceError`: transport and
+retryable HTTP failures are `Transient` (every neutral write converges, so a
+retry is safe), 401/403 are `Authentication`, and device or configuration
+errors are `Rejected`, each with the number of writes acknowledged before the
+failure.
+
 ## Operational eDSL
 
-The activation service can retrieve credentials from Vault, authenticate the
+A caller can retrieve credentials from its secret store, authenticate the
 client, and then execute a credential-free operation program. The eDSL delegates
 to the same tested NX-API methods as the direct API:
 
@@ -38,7 +63,7 @@ use nxapi::{
 use std::num::NonZeroU64;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-// The activation service obtains these values from Vault.
+// The caller obtains these values from its secret store.
 let username = std::env::var("NXAPI_USERNAME")?;
 let password = std::env::var("NXAPI_PASSWORD")?;
 
@@ -86,9 +111,9 @@ use nxapi::{
 use std::num::NonZeroU64;
 
 # async fn example(client: &nxapi::Client) -> Result<(), Box<dyn std::error::Error>> {
-let name: PolicyName = "quota-10m".parse()?;
+let name: PolicyName = "rate-10m".parse()?;
 let classifier = IpQosClassifier::new(
-    "subscriber-42",
+    "classifier-42",
     IpMatch::source("192.0.2.42".parse::<IpAddress>()?),
 )?;
 let policy = BandwidthPolicy {
@@ -131,11 +156,11 @@ use nxapi::{Client, BandwidthPolicy, Direction};
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let mut client = Client::builder("https://192.0.2.10:443")
     .timeout(std::time::Duration::from_secs(5))
-    .policy_prefix("pcef")
+    .policy_prefix("edge")
     .build()?;
 client.login(&std::env::var("NXAPI_USERNAME")?,
              &std::env::var("NXAPI_PASSWORD")?).await?;
-let name = "quota-10m".parse()?;
+let name = "rate-10m".parse()?;
 let interface = "Ethernet1/10".parse()?;
 let mut policy = BandwidthPolicy {
     rate_bps: 10_000_000.try_into()?,
@@ -196,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  &std::env::var("NXAPI_PASSWORD")?).await?;
     let interface: EthernetInterface = "Ethernet1/10".parse()?;
 
-    // Block the dedicated customer port.
+    // Shut the interface down.
     client.apply(&EnforcementOperation::SetAdminState {
         interface: interface.clone(), enabled: false,
     }).await?;
@@ -207,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }).await?;
     assert!(client.admin_state(&interface).await?);
 
-    // Customer upload: create a policer and attach the ingress policy.
+    // Received traffic: create a policer and attach the ingress policy.
     client.apply(&EnforcementOperation::Throttle {
         interface: interface.clone(),
         direction: Direction::Ingress,
@@ -215,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         burst_bytes: NonZeroU64::new(65_536),
     }).await?;
 
-    // Remove this restriction. Repeat with Egress for customer download.
+    // Remove this restriction. Repeat with Egress for sent traffic.
     client.apply(&EnforcementOperation::RemoveThrottle {
         interface, direction: Direction::Ingress,
     }).await?;
@@ -239,7 +264,7 @@ Authentication failures are returned, not retried.
 
 Rates are bits per second; explicit bursts are bytes. A missing burst leaves the
 device's current/default burst unchanged. Each operation affects one direction:
-ingress is customer upload, egress is customer download. Removal detaches the
+ingress is traffic received on the interface, egress is traffic sent out of it. Removal detaches the
 owned service-policy, then deletes the entire owned policy map (including its
 class and policer). It does not enable a disabled interface. Already-detached
 policies skip the detach step, so empty maps left by 0.2.0 can still be cleaned up.
@@ -256,17 +281,17 @@ This request sequence is covered by mock HTTP tests; verify it on the target
 NX-OS release before production rollout. No live-switch verification is implied.
 
 Policy names are `nxapi-eth1-10-in` / `nxapi-eth1-10-out`. Set
-`.policy_prefix("pcef")` on the client builder when adopting existing PCEF
-policers so removal/update addresses the same objects.
+`.policy_prefix(...)` on the client builder when adopting policers created
+under another prefix, so removal and update address the same objects.
 
-The caller must own a dedicated customer port and its QoS attachment; applying
+The caller must own the interface and its QoS attachment; applying
 a policy can replace an existing attachment. This profile uses class-default,
 not per-IP filtering on shared ports. It does not discover switch capabilities.
 Actual rate limits, direction support (particularly egress), burst granularity,
 and forwarding behavior depend on the Nexus hardware and NX-OS release.
 
 The DME policer uses `conformAction=transmit` and
-`exceedAction=unspecified`, matching the existing PCEF lab configuration.
+`exceedAction=unspecified`, matching the configuration verified in the lab.
 Device default exceed behavior and effective hardware policing must be checked
 in the target lab; an HTTP acknowledgement alone does not prove traffic limiting.
 
@@ -275,7 +300,7 @@ class-map referencing it, and a policy-map with a policer on that named class.
 `edit_ip_policy` verifies that exact single-class relationship before changing
 the named-class policer. The policy must still be attached to an interface with
 `assign_policy`; defining it alone does not affect traffic. A source-address
-classifier matches packets whose source is the subscriber IP, while a
+classifier matches packets whose source is the given IP, while a
 destination-address classifier matches packets whose destination is that IP.
 The optional second match can constrain both source and destination, provided
 both addresses use the same IP family. These packet semantics are independent
@@ -289,9 +314,10 @@ incomplete or malformed. Checks and writes are not atomic; serialize writers
 and reconcile partial failures. These DME reads and deletion payloads require
 validation against the target NX-OS release in a Nexus lab.
 
-Only one QoS policy-map can occupy an interface/direction attachment slot.
-This API does not yet combine multiple customer IP classes into one shared-port
-policy-map; calling `assign_policy` for another policy replaces that slot.
+Only one QoS policy-map can occupy an interface/direction attachment slot;
+calling `assign_policy` for another policy replaces that slot. The neutral
+access-list-scoped attachment combines several access lists on one interface
+in a single policy map, one class per list.
 
 Classifier deletion is intentionally not automated. Cisco documents the named
 ACL and class-map DNs and DME deletion convention, but the SDK cannot prove that
@@ -323,8 +349,7 @@ retained.
 QoS readback, traffic validation, login renewal and persistence across device
 reboots are not provided by this release.
 
-OSS events, inventory resolution and broker routing remain caller concerns.
-No dependency on PCEF or Qanat is required.
+Deciding what to configure, and naming access lists, are caller concerns.
 
 ## Verification
 

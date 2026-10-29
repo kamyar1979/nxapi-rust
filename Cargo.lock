@@ -570,13 +570,13 @@ dependencies = [
 
 [[package]]
 name = "network-device"
-version = "0.2.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45dd7dae20660ca008738db0f45afedfb10a0ce4c75cba9648a3b4887ca1a020"
+checksum = "f8d715bbccc866b4a04afdff093ac91facaf0583e6c353dcf6bb1a70675a9499"
 
 [[package]]
 name = "nxapi"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "network-device",

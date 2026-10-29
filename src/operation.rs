@@ -10,7 +10,7 @@ use crate::{
     ApplyError, ApplyReport, BandwidthPolicy, Client, Direction, EnforcementOperation, Error,
     EthernetInterface, InvalidInterface, IpQosClassifier, PolicyName,
 };
-use network_device::{AdministrativeState, Driver, Execute, InterfaceName, SetInterfaceState};
+use network_device::{Driver, Execute, InterfaceName};
 use std::future::Future;
 
 /// Error returned while executing a network-device operation through NX-API.
@@ -25,6 +25,9 @@ pub enum DriverError {
     /// A single NX-API request failed.
     #[error("NX-API request failed")]
     Request(#[source] Error),
+    /// The neutral operation is not supported by this driver.
+    #[error("operation not supported by the NX-API driver")]
+    Unsupported(#[source] network_device::Unsupported),
 }
 
 impl Driver for Client {
@@ -42,63 +45,6 @@ impl Execute<EnforcementOperation> for Client {
             Client::apply(self, &operation)
                 .await
                 .map_err(DriverError::Apply)
-        }
-    }
-}
-
-impl Execute<SetInterfaceState> for Client {
-    type Output = ApplyReport;
-
-    fn execute<'a>(
-        &'a self,
-        operation: SetInterfaceState,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + 'a {
-        async move {
-            let interface = parse_interface(&operation.interface)?;
-            let operation = EnforcementOperation::SetAdminState {
-                interface,
-                enabled: operation.state == AdministrativeState::Enabled,
-            };
-            Client::apply(self, &operation)
-                .await
-                .map_err(DriverError::Apply)
-        }
-    }
-}
-
-/// Reads the configured administrative state of an interface.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GetInterfaceState {
-    /// Interface whose configured state should be read.
-    pub interface: InterfaceName,
-}
-
-impl GetInterfaceState {
-    /// Creates an interface-state query.
-    pub fn new(interface: InterfaceName) -> Self {
-        Self { interface }
-    }
-}
-
-impl Execute<GetInterfaceState> for Client {
-    type Output = AdministrativeState;
-
-    fn execute<'a>(
-        &'a self,
-        operation: GetInterfaceState,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + 'a {
-        async move {
-            let interface = parse_interface(&operation.interface)?;
-            self.admin_state(&interface)
-                .await
-                .map(|enabled| {
-                    if enabled {
-                        AdministrativeState::Enabled
-                    } else {
-                        AdministrativeState::Disabled
-                    }
-                })
-                .map_err(DriverError::Request)
         }
     }
 }
@@ -373,7 +319,7 @@ impl Execute<RemoveIpBandwidthPolicy> for Client {
     }
 }
 
-fn parse_interface(interface: &InterfaceName) -> Result<EthernetInterface, DriverError> {
+pub(crate) fn parse_interface(interface: &InterfaceName) -> Result<EthernetInterface, DriverError> {
     interface
         .as_str()
         .parse()
@@ -394,8 +340,8 @@ mod tests {
     #[test]
     fn client_exposes_every_existing_device_operation() {
         assert_execute::<EnforcementOperation>();
-        assert_execute::<SetInterfaceState>();
-        assert_execute::<GetInterfaceState>();
+        assert_execute::<network_device::SetInterfaceState>();
+        assert_execute::<network_device::GetInterfaceState>();
         assert_execute::<DefineBandwidthPolicy>();
         assert_execute::<EditBandwidthPolicy>();
         assert_execute::<RemoveBandwidthPolicy>();
@@ -404,5 +350,12 @@ mod tests {
         assert_execute::<DefineIpBandwidthPolicy>();
         assert_execute::<EditIpBandwidthPolicy>();
         assert_execute::<RemoveIpBandwidthPolicy>();
+    }
+
+    fn assert_neutral<T: network_device::NeutralDriver>() {}
+
+    #[test]
+    fn client_is_a_complete_neutral_driver() {
+        assert_neutral::<Client>();
     }
 }

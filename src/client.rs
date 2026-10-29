@@ -112,7 +112,7 @@ struct ClientOptions {
     /// Explicit lab opt-in to invalid TLS certificates. Defaults to false.
     pub insecure_skip_tls_verify: bool,
     /// Prefix for SDK-owned per-interface policy maps. Defaults to "nxapi".
-    /// Set to "pcef" when taking over existing PCEF-generated policies.
+    /// Set it to an existing prefix to manage policies created under that prefix.
     pub policy_prefix: String,
     /// Maximum response size in bytes.
     pub max_response_bytes: usize,
@@ -536,7 +536,7 @@ impl Client {
         self.write_policy(name, policy).await
     }
 
-    async fn policy_matches(
+    pub(crate) async fn policy_matches(
         &self,
         name: &PolicyName,
         policy: &BandwidthPolicy,
@@ -977,7 +977,7 @@ impl Client {
         Ok(())
     }
 
-    async fn policy_exists(&self, name: &PolicyName) -> Result<bool, Error> {
+    pub(crate) async fn policy_exists(&self, name: &PolicyName) -> Result<bool, Error> {
         let path = format!("/api/mo/sys/ipqos/dflt/p/name-{}.json", name.as_str());
         let body = self.request(Method::GET, &path, None, true).await?;
         let items = body["imdata"]
@@ -997,7 +997,11 @@ impl Client {
         Ok(true)
     }
 
-    async fn write_policy(&self, name: &PolicyName, policy: &BandwidthPolicy) -> Result<(), Error> {
+    pub(crate) async fn write_policy(
+        &self,
+        name: &PolicyName,
+        policy: &BandwidthPolicy,
+    ) -> Result<(), Error> {
         let mut attrs = json!({"cirRate":policy.rate_bps.to_string(),"cirUnit":"bps", "conformAction":"transmit","exceedAction":"unspecified"});
         if let Some(burst) = policy.burst_bytes {
             attrs["bcRate"] = json!(burst.to_string());
@@ -1009,7 +1013,7 @@ impl Client {
         Ok(())
     }
 
-    fn assignment_path(interface: &EthernetInterface, direction: Direction) -> String {
+    pub(crate) fn assignment_path(interface: &EthernetInterface, direction: Direction) -> String {
         let direction = match direction {
             Direction::Ingress => "in",
             Direction::Egress => "out",
@@ -1020,7 +1024,7 @@ impl Client {
         )
     }
 
-    async fn write_assignment(
+    pub(crate) async fn write_assignment(
         &self,
         name: &PolicyName,
         interface: &EthernetInterface,
@@ -1038,7 +1042,7 @@ impl Client {
         Ok(())
     }
 
-    /// Apply one operation on a dedicated, caller-owned customer interface.
+    /// Apply one operation on a caller-owned interface.
     /// Throttle creates the policer before attaching it. On error, no later
     /// request is sent; earlier changes remain. No automatic retry is attempted.
     /// RemoveThrottle checks attachment ownership, detaches it, then deletes
@@ -1103,7 +1107,78 @@ impl Client {
 
     // ipqosInst is a singleton: its name is not part of its DN. Never delete
     // that slot without checking which policy is currently attached.
-    async fn owns_attachment(&self, path: &str, expected: &str) -> Result<bool, Error> {
+    /// Reads an SDK-shaped policy map (one `class-default` policer) back into
+    /// its rate and burst; `None` when the map does not exist.
+    pub(crate) async fn read_policer(
+        &self,
+        name: &PolicyName,
+    ) -> Result<Option<BandwidthPolicy>, Error> {
+        let body = self
+            .request(
+                Method::GET,
+                &format!("{}?rsp-subtree=full", ipqos::policy_path(name)),
+                None,
+                true,
+            )
+            .await?;
+        let items = body["imdata"]
+            .as_array()
+            .ok_or(Error::Response("missing policy data"))?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let attrs = items
+            .first()
+            .and_then(|item| item.get("ipqosPMapInst"))
+            .and_then(|map| map.get("children"))
+            .and_then(Value::as_array)
+            .filter(|children| children.len() == 1)
+            .and_then(|children| {
+                children[0].pointer("/ipqosMatchCMap/children/0/ipqosPolice/attributes")
+            })
+            .ok_or(Error::Response("policy is not a single policer"))?;
+        let number = |key: &str| {
+            attrs
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(std::num::NonZeroU64::new)
+        };
+        let rate_bps = number("cirRate").ok_or(Error::Response("missing policer rate"))?;
+        Ok(Some(BandwidthPolicy {
+            rate_bps,
+            burst_bytes: number("bcRate"),
+        }))
+    }
+
+    /// Name of the policy attached to an interface in one direction, if any.
+    pub(crate) async fn attached_policy(
+        &self,
+        interface: &EthernetInterface,
+        direction: Direction,
+    ) -> Result<Option<String>, Error> {
+        let path = format!("{}/pmap.json", Self::assignment_path(interface, direction));
+        let body = self.request(Method::GET, &path, None, true).await?;
+        let items = body["imdata"]
+            .as_array()
+            .ok_or(Error::Response("missing attachment data"))?;
+        match items.as_slice() {
+            [] => Ok(None),
+            [item] => Ok(item
+                .pointer("/ipqosInst/attributes/name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)),
+            _ => Err(Error::Response("ambiguous interface policy attachment")),
+        }
+    }
+
+    /// Name prefix of the per-interface throttle policies.
+    pub(crate) fn policy_prefix(&self) -> &str {
+        &self.options.policy_prefix
+    }
+
+    pub(crate) async fn owns_attachment(&self, path: &str, expected: &str) -> Result<bool, Error> {
         let body = self.request(Method::GET, path, None, true).await?;
         let items = body["imdata"]
             .as_array()
@@ -1129,7 +1204,7 @@ impl Client {
         Ok(true)
     }
 
-    async fn request(
+    pub(crate) async fn request(
         &self,
         method: Method,
         path: &str,
@@ -1188,7 +1263,7 @@ impl Client {
     }
 }
 
-fn dme_object_exists(body: &Value) -> Result<bool, Error> {
+pub(crate) fn dme_object_exists(body: &Value) -> Result<bool, Error> {
     let items = body["imdata"]
         .as_array()
         .ok_or(Error::Response("missing DME object data"))?;
@@ -1201,7 +1276,7 @@ fn dme_items<'a>(body: &'a Value, message: &'static str) -> Result<&'a Vec<Value
         .ok_or(Error::Response(message))
 }
 
-fn complete_class_items<'a>(
+pub(crate) fn complete_class_items<'a>(
     body: &'a Value,
     message: &'static str,
 ) -> Result<&'a Vec<Value>, Error> {
